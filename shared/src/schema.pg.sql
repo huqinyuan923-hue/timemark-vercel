@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS user_configs (
   reminder_catchup_minutes INTEGER,
   email_template_style TEXT DEFAULT 'classic',
   fallback_enabled BOOLEAN DEFAULT TRUE,
+  greeting_mode TEXT DEFAULT 'auto',
+  greeting_ai_enabled BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -233,6 +235,52 @@ CREATE TABLE IF NOT EXISTS event_trigger_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_trigger_logs_event ON event_trigger_logs(event_id);
 CREATE INDEX IF NOT EXISTS idx_trigger_logs_user ON event_trigger_logs(user_id);
+
+-- v79: AI birthday greetings — final composed text per contact/year/channel.
+-- Rotation basis (composeBirthdayGreeting) + audit trail + draft staging.
+CREATE TABLE IF NOT EXISTS greeting_history (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  contact_id INTEGER,
+  event_id INTEGER,
+  year TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'email',
+  status TEXT NOT NULL,
+  subject TEXT,
+  body_html TEXT,
+  recipients TEXT,
+  -- v80: AI budget gate + per-draft regeneration
+  source TEXT NOT NULL DEFAULT 'composer',
+  tone TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_greeting_history_user_year ON greeting_history(user_id, year DESC);
+
+-- v80: AI monthly digest archive ("AI keeps what matters") — raw trigger logs expire
+-- at 90 days; the AI narrative + deterministic stats JSON stay forever.
+CREATE TABLE IF NOT EXISTS digest_archive (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  period TEXT NOT NULL,
+  period_start DATE,
+  period_end DATE,
+  narrative_md TEXT,
+  stats_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_digest_archive_user_period ON digest_archive(user_id, period_start DESC);
+
+-- v80: bounded cron status — one row per job (upsert), replacing every-minute
+-- success rows; failed details stay in cron_execution_logs with 30d retention.
+CREATE TABLE IF NOT EXISTS cron_job_status (
+  job_name TEXT PRIMARY KEY,
+  last_status TEXT NOT NULL,
+  last_ok_at TIMESTAMPTZ,
+  last_error TEXT,
+  last_summary TEXT,
+  last_duration_ms INTEGER,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 CREATE INDEX IF NOT EXISTS idx_trigger_logs_date ON event_trigger_logs(trigger_date);
 -- A plain btree index is still the right shape for the TEXT token: the lookup is exact
 -- equality (`WHERE trigger_date = $2`) on the full key, never a prefix/LIKE pattern.
@@ -500,6 +548,9 @@ CREATE TABLE IF NOT EXISTS fixed_contacts (
   -- v41 (todo 68): household profile assignment (nullable, ON DELETE SET NULL).
   -- The FK constraint + backfill are applied by the v41 migration.
   profile_id INTEGER,
+  -- v79: direct birthday on the contact (greetings without a linked birthday event).
+  birth_date DATE,
+  greeting_opt_out BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

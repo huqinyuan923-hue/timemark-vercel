@@ -1,11 +1,24 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { Bell, ArrowLeft, Trash2, RefreshCw, CheckCircle2, XCircle, Calendar, AlertCircle, SkipForward } from 'lucide-react';
+import { Bell, Trash2, RefreshCw, CheckCircle2, XCircle, Calendar, AlertCircle, SkipForward } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import { Badge } from '@/components/ui/badge';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
+import { SkeletonCard } from '@/components/ui/skeleton-card';
 import { Button } from '@/components/ui/button';
-import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { readDelivery, type DeliveryOutcome } from '@timemark/shared';
+import { ChannelIcon } from '@/components/channels/ChannelIcon';
+import { fetchChannelTemplates } from '@/lib/channel-templates';
+import { EventReminderLogs } from '@/components/reminder/EventReminderLogs';
+
+/**
+ * v2.26 C：/reminders（提醒记录）并入本页 —— 两个页面展示的是同一类数据
+ * （事件提醒投递历史），只保留一个入口。tab 支持深链（?tab=reminders），
+ * 旧链接 /reminders 由 App.tsx 重定向过来。
+ */
+type LogsTab = 'delivery' | 'reminders';
 
 const containerVariants = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.1 } } };
 const itemVariants = { hidden: { opacity: 0, y: 15 }, visible: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 300, damping: 24 } as const } };
@@ -27,6 +40,8 @@ interface TriggerLog {
   /** JSONB：线上是已解析对象，历史 TEXT 列才是 JSON 字符串 */
   channel_results?: object | string | null;
   error_message?: string;
+  /** v2.28 C15：重试时后端写入的结构化逐渠道错误（此前前端从未展示） */
+  error_details?: string | null;
   created_at: string;
 }
 
@@ -76,7 +91,13 @@ const getEventTypeLabel = (type?: string): string => {
 import { formatRelativeTime } from '@/lib/format-time';
 
 export default function TriggerLogs() {
-  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState<LogsTab>(() =>
+    searchParams.get('tab') === 'reminders' ? 'reminders' : 'delivery',
+  );
+  // v2.25: 渠道徽章显示图标（模板 id → icon 名）
+  const [templateIcons, setTemplateIcons] = useState<Record<string, string>>({});
+
   const [logs, setLogs] = useState<TriggerLog[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -84,20 +105,32 @@ export default function TriggerLogs() {
   const [statusFilter, setStatusFilter] = useState('');
   const [channelFilter, setChannelFilter] = useState('');
 
-  const fetchLogs = async () => {
+  const switchTab = (next: LogsTab) => {
+    setTab(next);
+    setSearchParams(next === 'reminders' ? { tab: 'reminders' } : {}, { replace: true });
+  };
+
+  // v2.28 C15：分页游标（服务器锚定，本地删除不影响 offset 语义；本页无删除，
+  // 保留与 Inbox 同模式以防未来加入）。
+  const nextOffsetRef = useRef(0);
+
+  const fetchLogs = async (offset = 0) => {
     setLoading(true);
     try {
-      const params = new URLSearchParams({ limit: '100' });
+      const params = new URLSearchParams({ limit: '100', offset: String(offset) });
       // 状态下拉选的是「真实投递结果」（outcome）而不是裸 status：部分失败落库时
       // status='success'，按 status 筛会把绿色标签混进"成功"、且"失败"里漏掉它。
       if (statusFilter) params.set('outcome', statusFilter);
       if (channelFilter) params.set('channel', channelFilter);
       const res = await api.getRaw<TriggerLog[]>(`/trigger-logs?${params.toString()}`);
-      setLogs(res.data || []);
+      const page = res.data || [];
+      // v2.28 C15：加载更多 —— offset>0 追加
+      setLogs((prev) => (offset > 0 ? [...prev, ...page] : page));
+      nextOffsetRef.current = offset + page.length;
       setTotal((res.pagination?.total as number) || 0);
     } catch (error) {
       console.error('Failed to fetch trigger logs:', error);
-      setLogs([]);
+      if (offset === 0) setLogs([]);
     } finally {
       setLoading(false);
     }
@@ -105,7 +138,17 @@ export default function TriggerLogs() {
 
   useEffect(() => {
     fetchLogs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, channelFilter]);
+
+  // v2.25: 渠道徽章图标（模板目录是单飞缓存，会话内只拉一次）
+  useEffect(() => {
+    fetchChannelTemplates()
+      .then((templates) => {
+        setTemplateIcons(Object.fromEntries(templates.map((t) => [t.id, t.icon])));
+      })
+      .catch(() => undefined);
+  }, []);
 
   const exportCsv = async () => {
     const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
@@ -131,6 +174,7 @@ export default function TriggerLogs() {
       await api.delete('/trigger-logs');
       setLogs([]);
       setTotal(0);
+      nextOffsetRef.current = 0;
     } catch (error) {
       console.error('Failed to clear trigger logs:', error);
     } finally {
@@ -197,16 +241,11 @@ export default function TriggerLogs() {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen pb-24">
-      <header className="sticky top-6 z-40 px-4 max-w-4xl mx-auto">
-        <div className="glass-panel rounded-full px-6 py-3.5 flex justify-between items-center ring-1 ring-black/5 dark:ring-white/10 shadow-xs">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="icon" className="rounded-full" onClick={() => navigate(-1)}><ArrowLeft size={20} /></Button>
-            <div>
-              <h1 className="text-xl font-bold text-slate-900 dark:text-white tracking-tight">提醒日志</h1>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">共 {total} 条提醒记录</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
+      <PageHeader
+        title="提醒日志"
+        subtitle={tab === 'reminders' ? '事件维度的提醒发送记录' : `共 ${total} 条提醒记录`}
+        actions={tab === 'delivery' && (
+          <>
             <Button variant="ghost" size="sm" className="rounded-full min-h-11" onClick={retryAllFailed} disabled={retryingAll}>
               {retryingAll ? <RefreshCw size={16} className="mr-1 animate-spin" /> : null}
               {retryingAll ? '重试中' : '重试全部失败'}
@@ -214,53 +253,96 @@ export default function TriggerLogs() {
             <Button variant="ghost" size="sm" className="rounded-full min-h-11" onClick={exportCsv}>
               导出 CSV
             </Button>
-            <Button variant="ghost" size="icon" className="rounded-full min-h-11 min-w-11" onClick={fetchLogs} disabled={loading}>
-              <RefreshCw size={20} className={loading ? 'animate-spin' : ''} />
-            </Button>
             <Button variant="ghost" size="sm" className="rounded-full text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30" onClick={clearLogs} disabled={clearing || logs.length === 0}>
               <Trash2 size={16} className="mr-1" />
               清空
             </Button>
-          </div>
+          </>
+        )}
+        onRefresh={tab === 'delivery' ? () => fetchLogs() : undefined}
+        refreshing={loading}
+      />
+      <div className="max-w-4xl mx-auto px-6 mt-3">
+        <div className="inline-flex rounded-full glass-panel p-1 ring-1 ring-black/5 dark:ring-white/10" role="tablist" aria-label="日志类型">
+          {([
+            ['delivery', '投递明细'],
+            ['reminders', '事件提醒'],
+          ] as Array<[LogsTab, string]>).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="tab"
+              aria-selected={tab === value}
+              onClick={() => switchTab(value)}
+              className={`px-4 h-9 rounded-full text-sm font-medium transition-colors ${
+                tab === value
+                  ? 'bg-primary-500 text-white shadow'
+                  : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
-      </header>
-      <div className="max-w-4xl mx-auto px-6 mt-3 flex flex-wrap gap-2">
-        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="h-11 px-3 rounded-xl border text-sm" aria-label="状态筛选">
-          <option value="">全部状态</option>
-          <option value="delivered">成功</option>
-          <option value="partial">部分失败</option>
-          <option value="failed">失败</option>
-          <option value="skipped">跳过</option>
-        </select>
-        <input
-          value={channelFilter}
-          onChange={(e) => setChannelFilter(e.target.value)}
-          placeholder="渠道筛选"
-          className="h-11 px-3 rounded-xl border text-sm"
-          aria-label="渠道筛选"
-        />
       </div>
+      {tab === 'delivery' && (
+        <div className="max-w-4xl mx-auto px-6 mt-3 flex flex-wrap gap-2">
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="h-11 px-3 rounded-xl border text-sm" aria-label="状态筛选">
+            <option value="">全部状态</option>
+            <option value="delivered">成功</option>
+            <option value="partial">部分失败</option>
+            <option value="failed">失败</option>
+            <option value="skipped">跳过</option>
+          </select>
+          {/* v2.28 C15：渠道筛选从自由文本改为下拉（id 来自渠道模板目录） */}
+          <select
+            value={channelFilter}
+            onChange={(e) => setChannelFilter(e.target.value)}
+            className="h-11 px-3 rounded-xl border text-sm bg-white dark:bg-slate-800"
+            aria-label="渠道筛选"
+          >
+            <option value="">全部渠道</option>
+            {Object.keys(templateIcons).map((id) => (
+              <option key={id} value={id}>{id}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {tab === 'reminders' ? (
+        <main className="max-w-4xl mx-auto px-6 py-10 mt-2">
+          <div className="flex justify-end mb-2">
+            {/* v2.27 F41：事件提醒历史导出 CSV（后端 /events/reminder-logs?format=csv） */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="rounded-full min-h-11"
+              onClick={async () => {
+                const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
+                const res = await fetch('/api/events/reminder-logs?format=csv', {
+                  credentials: 'include',
+                  headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
+                if (!res.ok) return alert('导出失败');
+                const blob = await res.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `reminder-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+              }}
+            >
+              导出 CSV
+            </Button>
+          </div>
+          <EventReminderLogs />
+        </main>
+      ) : (
       <main className="max-w-4xl mx-auto px-6 py-10 mt-2">
         {loading ? (
-          <div className="space-y-4">
-            {[1, 2, 3, 4].map((i) => (
-              <div key={i} className="glass-panel rounded-[2.5rem] p-6 animate-pulse">
-                <div className="flex gap-6">
-                  <div className="w-16 h-16 rounded-[1.5rem] bg-slate-200/60 dark:bg-slate-700/50"></div>
-                  <div className="flex-1">
-                    <div className="h-5 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/3 mb-3"></div>
-                    <div className="h-4 bg-slate-200/60 dark:bg-slate-700/50 rounded-full w-1/2"></div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <SkeletonCard count={4} />
         ) : logs.length === 0 ? (
-          <div className="text-center py-16 glass-panel rounded-[2.5rem] ring-1 ring-black/5 dark:ring-white/10">
-            <Bell size={48} className="mx-auto text-slate-300 dark:text-slate-600 mb-4" />
-            <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-2">暂无提醒记录</h3>
-            <p className="text-slate-500 dark:text-slate-400">事件提醒触发后将在此处显示</p>
-          </div>
+          <EmptyState icon={Bell} title="暂无提醒记录" description="事件提醒触发后将在此处显示" />
         ) : (
           <motion.div variants={containerVariants} initial="hidden" animate="visible" className="relative">
             <div className="absolute left-[2.25rem] top-8 bottom-8 w-px bg-gradient-to-b from-primary-500/40 via-slate-200 dark:via-slate-700 to-transparent z-0"></div>
@@ -308,9 +390,10 @@ export default function TriggerLogs() {
                                 {delivery.delivered.map((ch) => (
                                   <span
                                     key={ch}
-                                    className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
                                     title={channelResults[ch]?.error || ''}
                                   >
+                                    <ChannelIcon name={templateIcons[ch]} size={12} />
                                     ✓ {ch}
                                   </span>
                                 ))}
@@ -334,6 +417,16 @@ export default function TriggerLogs() {
                                 parseChannelResults(null) 返回 {}，恒为真，所以这句话从来没显示过。 */}
                             {!isSuccess && log.error_message && !log.channel_results && (
                               <span className="text-red-500 text-xs">{log.error_message}</span>
+                            )}
+                            {log.error_details && delivery.outcome !== 'delivered' && (
+                              <details className="text-xs">
+                                <summary className="cursor-pointer select-none text-slate-400 hover:text-slate-600">
+                                  重试错误详情
+                                </summary>
+                                <pre className="mt-1 whitespace-pre-wrap break-words rounded-lg bg-slate-50 dark:bg-slate-800/60 px-2 py-1 max-h-32 overflow-y-auto overscroll-contain text-red-400">
+                                  {log.error_details}
+                                </pre>
+                              </details>
                             )}
                             {delivery.outcome === 'partial' && (
                               <span className="text-xs text-amber-600 dark:text-amber-400">
@@ -368,9 +461,23 @@ export default function TriggerLogs() {
                 );
               })}
             </div>
+            {/* v2.28 C15：加载更多（服务器锚定 offset） */}
+            {logs.length < total && (
+              <div className="text-center mt-6">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="rounded-full min-h-11"
+                  onClick={() => fetchLogs(nextOffsetRef.current)}
+                >
+                  加载更多（已加载 {logs.length}/{total}）
+                </Button>
+              </div>
+            )}
           </motion.div>
         )}
       </main>
+      )}
     </motion.div>
   );
 }

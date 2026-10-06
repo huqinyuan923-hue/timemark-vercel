@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import {
   AlarmClock,
   Calendar,
@@ -166,7 +167,8 @@ export function CommandPalette() {
 
   const activate = useCallback(
     (hit: GlobalSearchHit) => {
-      navigate(TYPE_ROUTES[hit.owner_type]);
+      // v2.27 F35：深链带 ?focus=<id>，目标页可据此定位/高亮（未消费的页面安全忽略）
+      navigate(`${TYPE_ROUTES[hit.owner_type]}?focus=${hit.owner_id}`);
       setOpen(false);
     },
     [navigate],
@@ -195,32 +197,42 @@ export function CommandPalette() {
     location.pathname.startsWith('/embed/');
 
   if (!isAuthenticated || excluded) return null;
-  if (!open) return null;
 
   const trimmed = query.trim();
   const activeFacets = facets
     ? GLOBAL_SEARCH_TYPES.filter((type) => (facets[type] ?? 0) > 0)
     : [];
 
+  // v2.26 D：命令面板补出场/退场动画 + 结果列表 overscroll-contain。
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center p-4 pt-[12vh]"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) setOpen(false);
-      }}
-    >
-      <div
-        className="absolute inset-0 bg-slate-950/30 backdrop-blur-sm"
-        aria-hidden
-        onClick={() => setOpen(false)}
-      />
-      <div
-        data-testid="command-palette"
-        role="dialog"
-        aria-modal="true"
-        aria-label="全局搜索"
-        className="glass-panel relative z-10 w-full max-w-xl overflow-hidden rounded-2xl"
+    <AnimatePresence>
+      {open && (
+      <motion.div
+        className="fixed inset-0 z-50 flex items-start justify-center p-4 pt-[12vh]"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.14 }}
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setOpen(false);
+        }}
       >
+        <div
+          className="absolute inset-0 bg-slate-950/30 backdrop-blur-sm"
+          aria-hidden
+          onClick={() => setOpen(false)}
+        />
+        <motion.div
+          data-testid="command-palette"
+          role="dialog"
+          aria-modal="true"
+          aria-label="全局搜索"
+          className="glass-panel relative z-10 w-full max-w-xl overflow-hidden rounded-2xl"
+          initial={{ opacity: 0, y: -10, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -10, scale: 0.98 }}
+          transition={{ duration: 0.16, ease: 'easeOut' }}
+        >
         <div className="flex items-center gap-2 border-b border-white/40 px-4 py-3 dark:border-white/10">
           <Search size={18} className="shrink-0 text-slate-500 dark:text-slate-400" aria-hidden />
           <input
@@ -266,7 +278,7 @@ export function CommandPalette() {
           id="command-palette-listbox"
           aria-label="搜索结果"
           data-testid="command-palette-results"
-          className="max-h-[50vh] overflow-y-auto py-1"
+          className="max-h-[50vh] overflow-y-auto overscroll-contain py-1"
         >
           {results.map((hit, index) => (
             <li
@@ -305,9 +317,43 @@ export function CommandPalette() {
           </p>
         )}
         {trimmed === '' && (
-          <p data-testid="command-palette-hint" className="px-4 py-6 text-center text-sm text-hint">
-            输入关键词，搜索事件、联系人、互动、证件、到期、物品、保养、习惯、目标和收件箱
-          </p>
+          <div data-testid="command-palette-hint" className="px-4 py-4 text-center text-sm text-hint">
+            <p>输入关键词，搜索事件、联系人、互动、证件、到期、物品、保养、习惯、目标和收件箱</p>
+            {/* v2.25: 快捷入口——本地 AI */}
+            <div className="mt-3 flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                data-testid="command-palette-quick-local-ai"
+                onClick={() => {
+                  setOpen(false);
+                  navigate('/local-ai');
+                }}
+                className="rounded-full border border-violet-200 dark:border-violet-800/50 bg-violet-50 dark:bg-violet-900/30 px-3 py-1.5 text-xs text-violet-700 dark:text-violet-300 hover:bg-violet-100 dark:hover:bg-violet-900/50 transition"
+              >
+                ✨ 本地 AI（浏览器推理）
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  navigate('/channels');
+                }}
+                className="rounded-full border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+              >
+                通知渠道
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  navigate('/trigger-logs');
+                }}
+                className="rounded-full border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+              >
+                提醒日志
+              </button>
+            </div>
+          </div>
         )}
 
         <div className="flex items-center justify-end gap-3 border-t border-white/40 px-4 py-2 text-xs text-hint dark:border-white/10">
@@ -315,7 +361,9 @@ export function CommandPalette() {
           <span>↵ 打开</span>
           <span>esc 关闭</span>
         </div>
-      </div>
-    </div>
+        </motion.div>
+      </motion.div>
+      )}
+    </AnimatePresence>
   );
 }

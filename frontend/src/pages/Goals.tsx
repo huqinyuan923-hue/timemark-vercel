@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, CalendarClock, CheckCircle2, Circle, Pencil, Plus, Target, Trash2 } from 'lucide-react';
+import { CalendarClock, CheckCircle2, Circle, Pencil, Plus, Target, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
-import { useSmartBack } from '@/hooks/useSmartBack';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
 import { api } from '@/lib/api';
 import { dueCountdownLabel, goalPercent } from '@/lib/goals-utils';
 import type { GoalStatus, GoalWithMilestones, MilestoneRecord } from '@timemark/shared';
@@ -57,8 +58,6 @@ function toForm(goal: GoalWithMilestones): GoalForm {
 }
 
 export default function Goals() {
-  const goBack = useSmartBack('/dashboard');
-
   const [goals, setGoals] = useState<GoalWithMilestones[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -74,10 +73,14 @@ export default function Goals() {
    *  pending list refresh can never swallow a keystroke into stale state. */
   const milestoneInputs = useRef<Record<number, HTMLInputElement | null>>({});
 
+  // v2.27 F43：排序键 + 方向（服务端 ?sort=/order= 支持）
+  const [sortBy, setSortBy] = useState<'created_at' | 'title' | 'status'>('created_at');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+
   const load = useCallback(async () => {
-    const list = await api.get<GoalWithMilestones[]>('/goals');
+    const list = await api.get<GoalWithMilestones[]>(`/goals?sort=${sortBy}&order=${sortOrder}`);
     setGoals(Array.isArray(list) ? list : []);
-  }, []);
+  }, [sortBy, sortOrder]);
 
   useEffect(() => {
     let cancelled = false;
@@ -216,36 +219,58 @@ export default function Goals() {
 
   return (
     <div className="min-h-screen pb-24">
-      <header className="sticky top-4 z-40 px-4 max-w-4xl mx-auto" role="banner" aria-label="目标页顶部导航">
-        <div className="glass-panel rounded-full px-4 py-3 flex items-center gap-3 ring-1 ring-black/5 dark:ring-white/10">
-          <Button variant="ghost" size="icon" className="rounded-full min-h-11 min-w-11" onClick={goBack} aria-label="返回上一页">
-            <ArrowLeft size={20} aria-hidden />
-          </Button>
-          <div className="flex-1 min-w-0">
-            <h1 className="text-lg font-bold truncate">目标</h1>
-            <p className="text-xs text-hint truncate">目标卡片 · 里程碑清单 · 到期倒计时</p>
-          </div>
+      <PageHeader
+        title="目标"
+        subtitle="目标卡片 · 里程碑清单 · 到期倒计时"
+        back="smart"
+        actions={
           <Button onClick={openCreate} className="rounded-full min-h-11" aria-label="新建目标">
             <Plus className="w-4 h-4 mr-1" aria-hidden />
             新建
           </Button>
-        </div>
-      </header>
+        }
+      />
 
       <main id="main-content" className="max-w-4xl mx-auto px-4 py-6 space-y-4" tabIndex={-1}>
+        {/* v2.27 F43：排序工具条 */}
+        <div className="flex flex-wrap gap-2 items-center">
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+            className="h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm"
+            aria-label="排序字段"
+          >
+            <option value="created_at">按创建时间</option>
+            <option value="title">按名称</option>
+            <option value="status">按状态</option>
+          </select>
+          <Button
+            variant="outline"
+            size="sm"
+            className="rounded-full min-h-10"
+            aria-label="切换排序方向"
+            onClick={() => setSortOrder((o) => (o === 'asc' ? 'desc' : 'asc'))}
+          >
+            {sortOrder === 'asc' ? '↑ 升序' : '↓ 降序'}
+          </Button>
+        </div>
         {error && <p className="text-sm text-destructive glass-panel rounded-2xl px-4 py-3" role="alert">{error}</p>}
         {status && <p className="text-sm text-hint glass-panel rounded-2xl px-4 py-3" role="status">{status}</p>}
 
         {loading ? (
           <p className="text-hint text-sm" role="status">加载中…</p>
         ) : goals.length === 0 ? (
-          <div data-testid="goal-empty" className="text-center py-16 glass-panel rounded-3xl">
-            <Target className="w-12 h-12 mx-auto text-slate-300 dark:text-slate-600 mb-3" aria-hidden />
-            <p className="font-semibold text-slate-700 dark:text-slate-200">还没有目标</p>
-            <p className="text-sm text-hint mt-1">创建第一个目标，用里程碑把大计划拆成小步</p>
-            <Button className="mt-4 rounded-full" variant="outline" onClick={openCreate}>
-              新建目标
-            </Button>
+          <div data-testid="goal-empty">
+            <EmptyState
+              icon={Target}
+              title="还没有目标"
+              description="创建第一个目标，用里程碑把大计划拆成小步"
+              action={
+                <Button className="rounded-full" variant="outline" onClick={openCreate}>
+                  新建目标
+                </Button>
+              }
+            />
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -427,7 +452,7 @@ export default function Goals() {
       <MobileBottomNav />
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-h-[90vh] overflow-y-auto max-w-lg">
+        <DialogContent className="max-h-[90vh] overflow-y-auto overscroll-contain max-w-lg">
           <DialogHeader>
             <DialogTitle>{editingId != null ? '编辑目标' : '新建目标'}</DialogTitle>
           </DialogHeader>

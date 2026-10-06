@@ -38,12 +38,30 @@ async function logCronRun(
   summary?: string,
   errorMessage?: string,
 ) {
+  const durationMs = Date.now() - startedAt;
   try {
+    // v2.26: 成功 → cron_job_status upsert（每 job 恒一行，替代每分钟一条的
+    // 无限增长；/api/health 与 cron-monitor 读这张有界表，不再全表排序）。
+    // 失败 → 保留 cron_execution_logs 明细行（30 天清理）便于排障。
     await query(
-      `INSERT INTO cron_execution_logs (job_name, status, duration_ms, result_summary, error_message)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [jobName, status, Date.now() - startedAt, summary ?? null, errorMessage ?? null],
+      `INSERT INTO cron_job_status (job_name, last_status, last_ok_at, last_error, last_summary, last_duration_ms, updated_at)
+       VALUES ($1, $2, CASE WHEN $2 = 'success' THEN NOW() ELSE NULL END, $3, $5, $4, NOW())
+       ON CONFLICT (job_name) DO UPDATE SET
+         last_status = EXCLUDED.last_status,
+         last_ok_at = CASE WHEN EXCLUDED.last_status = 'success' THEN NOW() ELSE cron_job_status.last_ok_at END,
+         last_error = EXCLUDED.last_error,
+         last_summary = EXCLUDED.last_summary,
+         last_duration_ms = EXCLUDED.last_duration_ms,
+         updated_at = NOW()`,
+      [jobName, status, errorMessage ?? null, durationMs, summary ?? null],
     );
+    if (status === 'failed') {
+      await query(
+        `INSERT INTO cron_execution_logs (job_name, status, duration_ms, result_summary, error_message)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [jobName, status, durationMs, summary ?? null, errorMessage ?? null],
+      );
+    }
   } catch (error) {
     // Table may not exist on very old DBs — log and continue, never crash the job.
     log.warn(
@@ -136,7 +154,9 @@ export async function checkCronGapAlert(jobName: string): Promise<void> {
           userId: admins.rows[0].user_id as number,
           title: 'Cron 执行间隔异常',
           body: `${jobName} 距上次成功已超过 ${Math.round(gapMs / 60000)} 分钟`,
-          source: 'broadcast',
+          // v2.30 修复：收件箱列表只展示 source='inbound'，写成 broadcast 的告警
+          // 在 UI 里永远不可见（摸底发现的断点）。
+          source: 'inbound',
         });
       }
     }
@@ -183,8 +203,10 @@ cronRoutes.get('/retry-notifications', async (c) => {
 cronRoutes.get('/digest', async (c) => {
   const startedAt = Date.now();
   const periodRaw = c.req.query('period') ?? 'monthly';
-  if (periodRaw !== 'monthly' && periodRaw !== 'yearly') {
-    return c.json({ success: false, error: 'period must be monthly or yearly' }, 400);
+  // v2.30 方向 A：period 扩展 daily/weekly——每用户读 digest_daily/weekly_* 配置，
+  // 由 sendDigestForUser 内部判断本地时区是否到点 + digest_archive 查重防重发。
+  if (periodRaw !== 'monthly' && periodRaw !== 'yearly' && periodRaw !== 'daily' && periodRaw !== 'weekly') {
+    return c.json({ success: false, error: 'period must be monthly, yearly, daily or weekly' }, 400);
   }
   const period = periodRaw as DigestPeriod;
   try {
@@ -222,9 +244,16 @@ cronRoutes.get('/daily-maintenance', async (c) => {
     // Attachment retention (todo 57): orphan rows (no owner row) older than 30 days,
     // rows first then objects. Referenced attachments are never touched.
     const purgedAttachments = await purgeOrphanAttachments();
+    // v2.26: cron_execution_logs 只剩失败明细（成功路径迁 cron_job_status upsert）→ 30 天
     const purgedCronLogs = await query(
-      `DELETE FROM cron_execution_logs WHERE executed_at < NOW() - INTERVAL '90 days'`,
+      `DELETE FROM cron_execution_logs WHERE executed_at < NOW() - INTERVAL '30 days'`,
     );
+    // v2.26: 接线此前从未被调用的 agent jobs/events 清理（job-hardening 死代码激活）
+    const { purgeTerminalAgentJobs } = await import('../services/agent/job-hardening.service.js');
+    const purgedAgentJobs = await purgeTerminalAgentJobs().catch((err: unknown) => {
+      console.warn('[daily-maintenance] agent job purge failed:', err instanceof Error ? err.message : err);
+      return { purgedJobs: 0, purgedEvents: 0 };
+    });
     const aggregatedStats = await aggregateDailyStats();
     // Checkbox 105: deterministic behavioural-pattern miner (no LLM, no external call).
     // Replaces each user's prior rows, so a timezone change re-buckets on the next night.

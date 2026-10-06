@@ -62,8 +62,13 @@ export default function DeployWizard() {
               {
                 id: 'turnstile',
                 label: 'Cloudflare Turnstile',
+                // v2.30：checks.turnstile 只在 SiteKey+Secret 齐全时为 true
                 ok: !!data.checks?.turnstile,
-                hint: data.checks?.turnstile ? '已配置' : '可选，未配置不影响核心功能',
+                hint: data.checks?.turnstile
+                  ? 'SiteKey + Secret 均已配置'
+                  : data.checks?.turnstileSecret && !data.checks?.turnstileSiteKey
+                    ? '缺 TURNSTILE_SITE_KEY：登录页验证组件不会出现且无法登录'
+                    : '可选，未配置不影响核心功能',
               },
             ]);
           }
@@ -80,7 +85,11 @@ export default function DeployWizard() {
               id: 'turnstile',
               label: 'Cloudflare Turnstile',
               ok: !!data.checks?.turnstile,
-              hint: data.checks?.turnstile ? '已配置' : '可选',
+              hint: data.checks?.turnstile
+                ? 'SiteKey + Secret 均已配置'
+                : data.checks?.turnstileSecret && !data.checks?.turnstileSiteKey
+                  ? '缺 TURNSTILE_SITE_KEY：登录页验证组件不会出现且无法登录'
+                  : '可选，未配置不影响核心功能',
             },
           ]);
         }
@@ -156,7 +165,7 @@ export default function DeployWizard() {
                 )}
                 <div>
                   <p className="font-medium">{item.label}</p>
-                  <p className="text-xs text-slate-500">{item.hint}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{item.hint}</p>
                 </div>
               </div>
             ))}
@@ -182,7 +191,7 @@ export default function DeployWizard() {
             <code className="text-xs bg-slate-100 dark:bg-slate-800 px-1 rounded">daily-maintenance</code>。
             两路可同时启用，重复触发不会重复发通知（服务端有防重发锁）。
           </p>
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
             一键配置：在项目根目录运行{' '}
             <code className="bg-slate-100 dark:bg-slate-800 px-1 rounded">.\scripts\setup-external-cron.ps1 -CronJobOrgApiKey &quot;你的密钥&quot;</code>
           </p>
@@ -192,9 +201,9 @@ export default function DeployWizard() {
             <div key={job.path} className="border border-slate-200 dark:border-slate-700 rounded-lg p-3 space-y-1">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-medium">{job.path.replace('/', '')}</span>
-                <span className="text-xs text-slate-500">{job.schedule}</span>
+                <span className="text-xs text-slate-500 dark:text-slate-400">{job.schedule}</span>
               </div>
-              <p className="text-xs text-slate-500">{job.description}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{job.description}</p>
               <p className="font-mono text-xs break-all bg-slate-100 dark:bg-slate-800 p-2 rounded">{cronBase}{job.path}</p>
               <p className="font-mono text-xs break-all bg-slate-100 dark:bg-slate-800 p-2 rounded">{cronCurl(job.path)}</p>
             </div>

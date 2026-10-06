@@ -3131,6 +3131,81 @@ ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS reminder_catchup_minutes INTEG
 ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS email_template_style TEXT NOT NULL DEFAULT 'classic';
 ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS fallback_enabled BOOLEAN NOT NULL DEFAULT TRUE;`,
     },
+    {
+      // v79: AI birthday greetings. Per-user greeting mode (auto = send on the day,
+      // draft = stage for one-click send) and AI toggle; contacts gain a birth_date so
+      // greetings work without a linked birthday event; greeting_history stores the
+      // final composed text per contact/year/channel (rotation basis + audit).
+      version: 79,
+      name: 'ai_birthday_greetings_v79',
+      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS greeting_mode TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS greeting_ai_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE fixed_contacts ADD COLUMN IF NOT EXISTS birth_date DATE;
+CREATE TABLE IF NOT EXISTS greeting_history (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  contact_id INTEGER,
+  event_id INTEGER,
+  year TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'email',
+  status TEXT NOT NULL,
+  subject TEXT,
+  body_html TEXT,
+  recipients TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_greeting_history_user_year ON greeting_history(user_id, year DESC);`,
+    },
+    {
+      // v80: log retention & bounded cron status.
+      // - greeting_history gains source (ai|composer) and tone for the greeting AI budget
+      //   gate and per-draft regeneration;
+      // - digest_archive stores the AI monthly digest narrative so raw trigger logs can
+      //   expire at 90 days without losing history ("AI keeps what matters");
+      // - cron_job_status is a one-row-per-job upsert (last outcome) replacing the
+      //   every-minute success rows; failed details stay in cron_execution_logs (30d);
+      // - indexes for the two hot paths: /api/health's cron status lookup and the
+      //   trigger-logs list ordering.
+      version: 80,
+      name: 'log_retention_and_ai_greetings_v80',
+      sql: `ALTER TABLE greeting_history ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'composer';
+ALTER TABLE greeting_history ADD COLUMN IF NOT EXISTS tone TEXT;
+CREATE TABLE IF NOT EXISTS digest_archive (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  period TEXT NOT NULL,
+  period_start DATE,
+  period_end DATE,
+  narrative_md TEXT,
+  stats_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_digest_archive_user_period ON digest_archive(user_id, period_start DESC);
+CREATE TABLE IF NOT EXISTS cron_job_status (
+  job_name TEXT PRIMARY KEY,
+  last_status TEXT NOT NULL,
+  last_ok_at TIMESTAMPTZ,
+  last_error TEXT,
+  last_summary TEXT,
+  last_duration_ms INTEGER,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cron_executed_at ON cron_execution_logs(executed_at);
+CREATE INDEX IF NOT EXISTS idx_trigger_user_created ON event_trigger_logs(user_id, created_at);`,
+    },
+    {
+      // v81 (v2.30 方向 A): AI 日报/周报自动化。每用户独立的日报/周报开关与投递时刻
+      // （用户本地时区，由 /api/cron/digest?period=daily|weekly 端点内逐用户判断是否到点）；
+      // 投递渠道复用既有 digest_channel_account_id，不新增列。防重走 digest_archive 查重。
+      // 全部 ADD COLUMN IF NOT EXISTS，可重跑。
+      version: 81,
+      name: 'digest_daily_weekly_schedule_v81',
+      sql: `ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_daily_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_daily_time TEXT NOT NULL DEFAULT '21:00';
+ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_day INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS digest_weekly_time TEXT NOT NULL DEFAULT '09:00';`,
+    },
   ];
 
   for (const migration of migrations) {

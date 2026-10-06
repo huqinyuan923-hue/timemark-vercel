@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, Flame, Pencil, Plus, Repeat, Trash2 } from 'lucide-react';
+import { Flame, Pencil, Plus, Repeat, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -8,7 +8,8 @@ import { Select } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
-import { useSmartBack } from '@/hooks/useSmartBack';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { EmptyState } from '@/components/ui/empty-state';
 import { api } from '@/lib/api';
 import {
   createHabitSchema,
@@ -121,7 +122,6 @@ function enumerateDays(from: string, to: string): string[] {
 
 export default function Habits() {
   const navigate = useNavigate();
-  const goBack = useSmartBack('/dashboard');
 
   const [habits, setHabits] = useState<HabitWithStreak[]>([]);
   const [grid, setGrid] = useState<HabitGridResult | null>(null);
@@ -155,8 +155,10 @@ export default function Habits() {
     return enumerateDays(grid.from, grid.to);
   }, [grid]);
 
+  // v2.27 F44：按名称/创建时间排序（服务端 ?sort= 支持）
+  const [sortBy, setSortBy] = useState<'created_at' | 'name'>('created_at');
   const load = useCallback(async () => {
-    const list = await api.get<HabitWithStreak[]>('/habits?active=true');
+    const list = await api.get<HabitWithStreak[]>(`/habits?active=true&sort=${sortBy}`);
     const rows = Array.isArray(list) ? list : [];
     setHabits(rows);
 
@@ -170,7 +172,7 @@ export default function Habits() {
     const to = shiftCalendarDays(from, 6) ?? anchor;
     const data = await api.get<HabitGridResult>(`/habits/grid?from=${from}&to=${to}`);
     setGrid(data && Array.isArray(data.habits) ? data : null);
-  }, []);
+  }, [sortBy]);
 
   useEffect(() => {
     let cancelled = false;
@@ -208,6 +210,31 @@ export default function Habits() {
       setError(e instanceof Error ? e.message : '打卡失败');
     } finally {
       setLoggingId(null);
+    }
+  };
+
+  // v2.30：今日一键打卡——把「今日应打卡且未达标」的习惯全部打上
+  const [bulkLogging, setBulkLogging] = useState(false);
+  const logAllDueToday = async () => {
+    const due = habits.filter((h) => isHabitScheduledOn(today, h.schedule_days) && !h.streak.targetMet);
+    if (due.length === 0) {
+      setStatus('今日全部达标，无需打卡 🎉');
+      return;
+    }
+    if (!confirm(`一键打卡 ${due.length} 个未达标的习惯？`)) return;
+    setBulkLogging(true);
+    setError('');
+    try {
+      for (const h of due) {
+        await api.post(`/habits/${h.id}/log`, {});
+      }
+      setStatus(`已批量打卡 ${due.length} 个习惯`);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '批量打卡失败（部分可能已成功）');
+      await refresh();
+    } finally {
+      setBulkLogging(false);
     }
   };
 
@@ -279,23 +306,31 @@ export default function Habits() {
 
   return (
     <div className="min-h-screen pb-24">
-      <header className="sticky top-4 z-40 px-4 max-w-4xl mx-auto" role="banner" aria-label="习惯打卡顶部导航">
-        <div className="glass-panel rounded-full px-4 py-3 flex items-center gap-3 ring-1 ring-black/5 dark:ring-white/10">
-          <Button variant="ghost" size="icon" className="rounded-full min-h-11 min-w-11" onClick={goBack} aria-label="返回上一页">
-            <ArrowLeft size={20} aria-hidden />
-          </Button>
-          <div className="flex-1 min-w-0">
-            <h1 className="text-lg font-bold truncate">习惯打卡</h1>
-            <p className="text-xs text-hint truncate">每日 / 每周目标 · 连胜 · 周视图</p>
-          </div>
+      <PageHeader
+        title="习惯打卡"
+        subtitle="每日 / 每周目标 · 连胜 · 周视图"
+        back="smart"
+        actions={
           <Button onClick={openCreate} className="rounded-full min-h-11" aria-label="新建习惯">
             <Plus className="w-4 h-4 mr-1" aria-hidden />
             新建
           </Button>
-        </div>
-      </header>
+        }
+      />
 
       <main id="main-content" className="max-w-4xl mx-auto px-4 py-6 space-y-6" tabIndex={-1}>
+        {/* v2.27 F44：排序切换 */}
+        <div className="flex justify-end">
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+            className="h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm"
+            aria-label="习惯排序"
+          >
+            <option value="created_at">按创建时间</option>
+            <option value="name">按名称</option>
+          </select>
+        </div>
         {error && (
           <p className="text-sm text-destructive glass-panel rounded-2xl px-4 py-3" role="alert">{error}</p>
         )}
@@ -306,18 +341,29 @@ export default function Habits() {
         {loading ? (
           <p className="text-hint text-sm" role="status">加载中…</p>
         ) : habits.length === 0 ? (
-          <div data-testid="habit-empty" className="text-center py-16 glass-panel rounded-3xl">
-            <Repeat className="w-12 h-12 mx-auto text-slate-300 dark:text-slate-600 mb-3" aria-hidden />
-            <p className="font-semibold text-slate-700 dark:text-slate-200">还没有习惯</p>
-            <p className="text-sm text-hint mt-1">创建第一个习惯，每天打卡，积累连胜</p>
-            <Button className="mt-4 rounded-full" variant="outline" onClick={openCreate}>
-              新建习惯
-            </Button>
+          <div data-testid="habit-empty">
+            <EmptyState
+              icon={Repeat}
+              title="还没有习惯"
+              description="创建第一个习惯，每天打卡，积累连胜"
+              action={
+                <Button className="rounded-full" variant="outline" onClick={openCreate}>
+                  新建习惯
+                </Button>
+              }
+            />
           </div>
         ) : (
           <>
             <section aria-label="今日习惯" className="space-y-2">
-              <h2 className="text-sm font-bold px-1 text-hint">今日习惯 · {habits.length}</h2>
+              <div className="flex items-center justify-between px-1">
+                <h2 className="text-sm font-bold text-hint">今日习惯 · {habits.length}</h2>
+                {habits.some((h) => isHabitScheduledOn(today, h.schedule_days) && !h.streak.targetMet) && (
+                  <Button size="sm" variant="outline" className="rounded-full h-7 text-xs" disabled={bulkLogging} onClick={logAllDueToday}>
+                    {bulkLogging ? '打卡中…' : '一键打卡未达标'}
+                  </Button>
+                )}
+              </div>
               {habits.map((habit) => {
                 const scheduled = isHabitScheduledOn(today, habit.schedule_days);
                 const met = habit.streak.targetMet;
@@ -481,7 +527,7 @@ export default function Habits() {
       <MobileBottomNav />
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-h-[90vh] overflow-y-auto max-w-lg">
+        <DialogContent className="max-h-[90vh] overflow-y-auto overscroll-contain max-w-lg">
           <DialogHeader>
             <DialogTitle>{editingId != null ? '编辑习惯' : '新建习惯'}</DialogTitle>
           </DialogHeader>

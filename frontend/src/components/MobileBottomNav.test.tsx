@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { BrowserRouter } from 'react-router-dom';
 import { initI18n, setLang } from '@/i18n';
@@ -68,7 +68,8 @@ describe('导航可达性', () => {
     expect(entryButtons).toHaveLength(NAV_ALL_PATHS.length);
 
     // 逐个点名曾经失联的页面，确保它们真的出现在面板里
-    for (const name of ['Cron 监控', '数据健康', '今日一览', 'AI 助手', '智能体控制台', '问答', '农历节日', 'Docker 迁移']) {
+    // （v2.26 C：/assistant 页删除、入口只剩 dock，面板里不再有「AI 助手」）
+    for (const name of ['Cron 监控', '数据健康', '今日一览', '本地 AI', '智能体控制台', '智能问答', '农历节日', 'Docker 迁移']) {
       expect(within(dialog).getByRole('button', { name })).toBeInTheDocument();
     }
   });
@@ -89,7 +90,7 @@ describe('导航可达性', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: /Cron 监控/ }));
 
     expect(navigateMock).toHaveBeenCalledWith('/cron-monitor');
-    // 导航后应关闭，避免遮罩留在屏幕上
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    // 导航后应关闭，避免遮罩留在屏幕上（v2.26 D：退场动画期间元素仍在，等它摘除）
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
 });

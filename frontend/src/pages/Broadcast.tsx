@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { ArrowLeft, Send, Mail, ChevronRight, Eye, Users } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useSmartBack } from '@/hooks/useSmartBack';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -42,6 +42,9 @@ interface Campaign {
 export default function Broadcast() {
   const navigate = useNavigate();
   const goBack = useSmartBack('/dashboard');
+  // v2.26 C：联系人页「快捷发信」深链进来（/broadcast?contact=<id>），预选该联系人。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const deepLinkContactId = Number(searchParams.get('contact') ?? '') || null;
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [emailAccounts, setEmailAccounts] = useState<EmailAccount[]>([]);
   const [accountId, setAccountId] = useState<number | ''>('');
@@ -53,6 +56,9 @@ export default function Broadcast() {
   const [sending, setSending] = useState(false);
   const [message, setMessage] = useState('');
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  // v2.30：发送确认闸门（群发是真发出去的邮件，点一下就该出去太危险）+ 服务端渲染预览
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<{ subject: string; htmlPreview: string } | null>(null);
 
   const [activeCategory, setActiveCategory] = useState<BroadcastTemplateCategory | null>(null);
   const [selectedGreetingId, setSelectedGreetingId] = useState<string | null>(null);
@@ -81,6 +87,16 @@ export default function Broadcast() {
     api.get<Campaign[]>('/broadcast/campaigns').then((d) => setCampaigns(d || [])).catch(() => {});
   }, []);
 
+  // 深链预选：联系人列表就绪后勾上目标联系人并消费掉 query，刷新/后退不再残留。
+  useEffect(() => {
+    if (deepLinkContactId === null || contacts.length === 0) return;
+    const target = contacts.find((c) => c.id === deepLinkContactId);
+    if (target && contactHasAnyEmail(target)) {
+      setSelectedIds((prev) => (prev.includes(target.id) ? prev : [...prev, target.id]));
+    }
+    setSearchParams({}, { replace: true });
+  }, [deepLinkContactId, contacts, setSearchParams]);
+
   const applyTemplate = (category: BroadcastTemplateCategory, greetingId: string) => {
     const built = buildBroadcastEmail(category, greetingId, subject || category.defaultSubject);
     setSubject(built.subject);
@@ -105,6 +121,34 @@ export default function Broadcast() {
     }
     if (emailAccounts.length === 0) {
       setMessage('请先配置邮件通知渠道');
+      return;
+    }
+    const emails = manualEmails.split(/[,;\s]+/).map((e) => e.trim()).filter((e) => e.includes('@'));
+    if (selectedIds.length === 0 && emails.length === 0) {
+      setMessage('请选择联系人或填写手动邮箱');
+      return;
+    }
+
+    // v2.30：先出确认框——拉服务端预览（占位符已替换、HTML 已消毒），
+    // 用户看到真实效果并确认后才真正发送。
+    setPreviewData(null);
+    setConfirmOpen(true);
+    try {
+      const preview = await api.post<{ subject: string; htmlPreview: string }>('/broadcast/preview', {
+        subject: subject.trim(),
+        html,
+      });
+      setPreviewData(preview);
+    } catch {
+      // 预览失败不阻塞确认（用户仍可按已有正文判断），但给出提示
+      setPreviewData(null);
+    }
+  };
+
+  const sendConfirmed = async () => {
+    setConfirmOpen(false);
+    if (!subject.trim() || !html.trim()) {
+      setMessage('请填写主题和正文');
       return;
     }
     const emails = manualEmails.split(/[,;\s]+/).map((e) => e.trim()).filter((e) => e.includes('@'));
@@ -144,12 +188,12 @@ export default function Broadcast() {
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-3xl mx-auto pb-24">
       <div className="flex items-center gap-3 mb-6">
-        <Button variant="ghost" size="icon" onClick={goBack}>
-          <ArrowLeft className="w-5 h-5" />
+        <Button variant="ghost" size="icon" onClick={goBack} aria-label="返回">
+          <ArrowLeft className="w-5 h-5" aria-hidden />
         </Button>
         <div>
           <h1 className="text-2xl font-bold flex items-center gap-2"><Mail className="w-6 h-6" />批量邮件</h1>
-          <p className="text-sm text-slate-500">选模板 → 选问候语 → 选收件人 → 发送</p>
+          <p className="text-sm text-slate-500 dark:text-slate-400">选模板 → 选问候语 → 选收件人 → 发送</p>
         </div>
       </div>
 
@@ -175,7 +219,7 @@ export default function Broadcast() {
               >
                 <span className="text-lg">{cat.emoji}</span>
                 <p className="text-sm font-medium mt-1">{cat.name}</p>
-                <p className="text-[10px] text-slate-500 line-clamp-2">{cat.description}</p>
+                <p className="text-[10px] text-slate-500 dark:text-slate-400 line-clamp-2">{cat.description}</p>
               </button>
             ))}
           </div>
@@ -305,8 +349,42 @@ export default function Broadcast() {
           {sending ? '发送中…' : `发送${recipientCount > 0 ? `（${recipientCount} 人）` : ''}`}
         </Button>
 
+        {/* v2.30：发送确认对话框——预览真实渲染效果 + 明确的收件规模警示 */}
+        {confirmOpen && (
+          <div role="dialog" aria-modal="true" aria-label="确认批量发送" className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="glass-panel rounded-3xl p-6 max-w-lg w-full ring-1 ring-black/10 dark:ring-white/10 max-h-[85vh] overflow-y-auto">
+              <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-2">确认批量发送？</h3>
+              <p className="text-sm text-slate-600 dark:text-slate-300 mb-4">
+                将向 <strong className="text-red-600">{recipientCount}</strong> 个邮箱真实发送邮件（每小时最多 10 次）。
+                邮件发出后无法撤回，请确认内容无误。
+              </p>
+              <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 mb-4 bg-white dark:bg-slate-800/60">
+                <p className="text-xs font-semibold text-slate-500 mb-1">主题预览</p>
+                <p className="text-sm font-medium text-slate-800 dark:text-slate-100">
+                  {previewData?.subject ?? subject.trim()}
+                </p>
+                {previewData?.htmlPreview && (
+                  <>
+                    <p className="text-xs font-semibold text-slate-500 mt-3 mb-1">正文预览（前 2000 字符，占位符已替换）</p>
+                    <div
+                      className="text-xs text-slate-600 dark:text-slate-300 max-h-40 overflow-y-auto [&_a]:text-blue-600"
+                      // htmlPreview 由服务端 sanitizeHtmlPreview 消毒后返回
+                      dangerouslySetInnerHTML={{ __html: previewData.htmlPreview }}
+                    />
+                  </>
+                )}
+                {!previewData && <p className="text-xs text-slate-400 mt-2">预览加载失败，可关闭后按已有正文判断。</p>}
+              </div>
+              <div className="flex gap-2 justify-end">
+                <Button variant="outline" onClick={() => setConfirmOpen(false)}>再检查一下</Button>
+                <Button variant="destructive" onClick={sendConfirmed}>确认发送（{recipientCount} 人）</Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {message && (
-          <p className={`text-sm text-center whitespace-pre-wrap ${message.includes('失败') || message.includes('0/') ? 'text-red-600' : 'text-slate-600'}`}>
+          <p className={`text-sm text-center whitespace-pre-wrap ${message.includes('失败') || message.includes('0/') ? 'text-red-600' : 'text-slate-600 dark:text-slate-400'}`}>
             {message}
           </p>
         )}
@@ -319,7 +397,7 @@ export default function Broadcast() {
             {campaigns.map((c) => (
               <div key={c.id} className="text-sm rounded-lg border p-3 flex justify-between gap-2">
                 <span className="truncate">{c.subject}</span>
-                <span className="text-slate-500 shrink-0">{c.success_count}/{c.recipient_count} · {c.status}</span>
+                <span className="text-slate-500 dark:text-slate-400 shrink-0">{c.success_count}/{c.recipient_count} · {c.status}</span>
               </div>
             ))}
           </div>

@@ -8,7 +8,7 @@ import { logSecurityEvent } from '../services/security-event.service.js';
 import { deleteSessionById, deleteAllUserSessions } from '../services/session.service.js';
 import { lookupGeoLabel } from '../utils/geoip.js';
 import type { User } from '@timemark/shared';
-import { isTurnstileEnabled } from '../utils/turnstile.js';
+import { isTurnstileEnabled, getTurnstileSiteKey } from '../utils/turnstile.js';
 import { getCronSecret } from '../utils/heartbeat.js';
 import { getAccessTokenFromCookie } from '../utils/auth-cookies.js';
 import { readBuildInfo } from '../utils/build-info.js';
@@ -290,6 +290,10 @@ security.post('/totp/recovery-codes', async (c) => {
 
 security.get('/deploy-info', async (c) => {
   const jwtAge = process.env.JWT_SECRET_ROTATED_AT || null;
+  // v2.29：可选功能体检（optionalEnvChecks）只对会话用户 / admin scope 的 API key 开放，
+  // 避免「实例启用了哪些能力」这一部署指纹泄露给受限 token。
+  const apiScopes = c.get('apiScopes' as unknown as 'user') as unknown as string[] | undefined;
+  const fullTrust = !Array.isArray(apiScopes) || apiScopes.includes('admin');
 
   let schemaVersion = 0;
   let databaseOk = false;
@@ -313,6 +317,8 @@ security.get('/deploy-info', async (c) => {
   const schemaHealth = computeSchemaHealth(recordedSchemaVersions);
 
   const turnstileConfigured = isTurnstileEnabled();
+  // v2.30：SiteKey 与 Secret 分开体检——只有 Secret 时登录页验证消失且登录被拒
+  const turnstileSiteKeyConfigured = !!getTurnstileSiteKey();
   const cronSecretConfigured = !!getCronSecret();
   const jwtConfigured = !!process.env.JWT_SECRET?.trim();
   const masterKeyConfigured = !!process.env.MASTER_KEY?.trim();
@@ -320,6 +326,65 @@ security.get('/deploy-info', async (c) => {
   const dbUrl = process.env.DATABASE_URL || '';
   const poolerRecommended = dbUrl.includes('neon.tech') || dbUrl.includes('supabase');
   const poolerDetected = dbUrl.includes('-pooler') || dbUrl.includes('pooler.');
+
+  // v2.29：可选功能的环境变量体检（只报配置与否，绝不回显值）。
+  const env = (name: string) => !!process.env[name]?.trim();
+  const optionalEnvChecks = [
+    {
+      id: 'telegramBot',
+      label: 'Telegram Bot',
+      ok: env('TELEGRAM_BOT_TOKEN'),
+      hint: '可选：配置 TELEGRAM_BOT_TOKEN 后可用 Telegram Bot 查询/提醒',
+    },
+    {
+      id: 'webPush',
+      label: 'Web Push（浏览器推送）',
+      ok: env('PUSH_VAPID_PUBLIC_KEY') && env('PUSH_VAPID_PRIVATE_KEY'),
+      hint: '可选：配置 PUSH_VAPID_PUBLIC_KEY / PRIVATE_KEY 后支持浏览器订阅推送',
+    },
+    {
+      id: 'googleOauth',
+      label: 'Google 日历 OAuth',
+      ok: env('GOOGLE_OAUTH_CLIENT_ID') && env('GOOGLE_OAUTH_CLIENT_SECRET'),
+      hint: '可选：配置 CLIENT_ID / CLIENT_SECRET 后可自动导入 Google 日历',
+    },
+    {
+      id: 'blobStorage',
+      label: 'Vercel Blob 附件存储',
+      ok: env('BLOB_READ_WRITE_TOKEN'),
+      hint: '可选：配置后证件附件可上传；未配置则附件功能降级',
+    },
+    {
+      id: 'embeddings',
+      label: 'AI 语义搜索（pgvector）',
+      ok: process.env.EMBEDDINGS_ENABLED === 'true' && env('EMBEDDINGS_BASE_URL') && env('EMBEDDINGS_API_KEY'),
+      hint: '可选：EMBEDDINGS_ENABLED=true 且配置 BASE_URL / API_KEY / MODEL 后启用语义搜索',
+    },
+    {
+      id: 'webauthn',
+      label: 'WebAuthn 无密码登录',
+      ok: env('WEBAUTHN_RP_ID') && env('WEBAUTHN_ORIGIN'),
+      hint: '可选：配置 WEBAUTHN_RP_ID / WEBAUTHN_ORIGIN 后支持 Passkey 登录',
+    },
+    {
+      id: 'appBaseUrl',
+      label: 'APP_BASE_URL（深链基址）',
+      ok: env('APP_BASE_URL'),
+      hint: '可选：Telegram 深链与 Webhook 回调的对外基址；未配置时按请求头推断',
+    },
+    {
+      id: 'deployToken',
+      label: 'DEPLOY_TOKEN（密钥轮换门）',
+      ok: env('DEPLOY_TOKEN'),
+      hint: '可选：配置后可用 /api/security/rotate-master-key 轮换 MASTER_KEY',
+    },
+    {
+      id: 'healthDetail',
+      label: 'HEALTH_DETAIL_TOKEN',
+      ok: env('HEALTH_DETAIL_TOKEN'),
+      hint: '可选：配置后 /api/health?detailed=1 返回组件级明细',
+    },
+  ];
 
   // Whether the bootstrap password has ever been changed. `null` means the admin is
   // still on the initial `DEFAULT_ADMIN_PASSWORD` and must change it on first login.
@@ -349,6 +414,7 @@ security.get('/deploy-info', async (c) => {
       platform: build.platform,
       vercelUrl: build.vercelUrl,
       turnstileConfigured,
+      turnstileSiteKeyConfigured,
       cronSecretConfigured,
       jwtConfigured,
       masterKeyConfigured,
@@ -377,6 +443,7 @@ security.get('/deploy-info', async (c) => {
           id: 'database',
           label: '数据库连接',
           ok: databaseOk,
+          severity: databaseOk ? undefined : 'error',
           hint: databaseOk ? 'PostgreSQL 连接正常' : '检查 Vercel 中的 DATABASE_URL',
         },
         ...(poolerRecommended ? [{
@@ -401,28 +468,43 @@ security.get('/deploy-info', async (c) => {
           id: 'jwtSecret',
           label: 'JWT_SECRET',
           ok: jwtConfigured,
+          severity: jwtConfigured ? undefined : 'error',
           hint: '登录会话签名密钥，须在 Vercel 环境变量中配置',
         },
         {
           id: 'masterKey',
           label: 'MASTER_KEY',
           ok: masterKeyConfigured,
+          severity: masterKeyConfigured ? undefined : 'error',
           hint: '加密渠道 Token 等敏感数据的密钥',
         },
         {
           id: 'cronSecret',
           label: 'CRON_SECRET / CRONSECRET',
           ok: cronSecretConfigured,
+          severity: cronSecretConfigured ? undefined : 'error',
           hint: '外部 Cron 调用 /api/cron/* 时的 Bearer 令牌（Vercel 可用 CRONSECRET）',
         },
         {
-          id: 'turnstile',
-          label: 'Cloudflare Turnstile（人机验证）',
+          id: 'turnstileSecret',
+          label: 'Turnstile Secret Key（人机验证）',
           ok: turnstileConfigured,
           hint: turnstileConfigured
             ? 'SecretKey / TURNSTILE_SECRET_KEY 已配置'
             : '可选：在 Vercel 配置 SecretKey 与 SiteKey；未配置则登录不启用人机验证',
         },
+        {
+          id: 'turnstileSiteKey',
+          label: 'Turnstile Site Key（与 Secret 配套）',
+          ok: !turnstileConfigured || turnstileSiteKeyConfigured,
+          severity: turnstileConfigured && !turnstileSiteKeyConfigured ? 'error' : undefined,
+          hint: turnstileSiteKeyConfigured
+            ? 'TURNSTILE_SITE_KEY 已配置'
+            : turnstileConfigured
+              ? '必需：已配置 Secret 但缺 SiteKey，登录页验证组件不会出现且无法登录（生产事故复盘 v2.28）'
+              : '与 SecretKey 成对配置后登录页才启用人机验证',
+        },
+        ...optionalEnvChecks.filter(() => fullTrust),
       ],
       channelNote:
         'Resend / Telegram 等通知渠道的 API Key 在「通知渠道」页面按账户填写，不属于此处环境变量检查。',

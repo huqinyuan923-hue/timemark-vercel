@@ -4,8 +4,7 @@ import { formatSourceBlock, buildRagMessages } from './rag';
 import { vectorCosine, sliceForEmbedding } from './embeddings';
 import { hashText } from './idb';
 import { isLocalChatCapable } from './device';
-import { webllmWeightsBytes, webLlmModelBaseUrl, webLlmModelFilesBaseUrl } from './models';
-import { WEBLLM_MODELS } from './models';
+import { WEBLLM_MODELS, modelWeightsBaseUrl, sameOriginKernelUrl, webLlmModelBaseUrl } from './models';
 
 describe('local-ai kb document builders', () => {
   it('eventDocText joins name/type/date/person/custom message', () => {
@@ -101,6 +100,28 @@ describe('local-ai rag prompt', () => {
     expect(messages[0]!.content).toContain('妈妈生日');
     expect(messages[1]!).toEqual({ role: 'user', content: '妈妈生日是什么时候' });
   });
+
+  it('buildRagMessages injects the last 3 turns as context (追问可答)', () => {
+    const history = [
+      { question: '最早一轮不该出现', answer: '被裁掉' },
+      { question: '我最近有什么重要的事？', answer: '有妈妈生日和护照续期。' },
+      { question: '还有呢？', answer: '还有燃气费要交。' },
+      { question: '保险呢？', answer: '车险 11 月到期。' },
+    ];
+    const messages = buildRagMessages('它呢？', hits, 150, history);
+    // system + 3 轮（6 条）+ 当前问题
+    expect(messages).toHaveLength(8);
+    expect(messages[1]).toEqual({ role: 'user', content: '我最近有什么重要的事？' });
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: '它呢？' });
+    const all = messages.map((m) => m.content).join('\n');
+    expect(all).not.toContain('最早一轮不该出现');
+    expect(all).toContain('车险 11 月到期');
+  });
+
+  it('system prompt bans markdown output', () => {
+    const messages = buildRagMessages('x', hits);
+    expect(messages[0]!.content).toContain('禁止任何 Markdown');
+  });
 });
 
 describe('local-ai idb hash', () => {
@@ -120,14 +141,29 @@ describe('local-ai device gate', () => {
 });
 
 describe('local-ai model contract', () => {
-  it('weights byte total counts only .bin shards', () => {
-    const bytes = webllmWeightsBytes(WEBLLM_MODELS.primary);
-    expect(bytes).toBe(277996288);
-    expect(WEBLLM_MODELS.primary.files.filter((f) => f.file.endsWith('.bin')).length).toBe(8);
+  it('phone tier: weights byte total counts only .bin shards, 8 shards under GitHub 100MB limit', () => {
+    const phone = WEBLLM_MODELS.phone;
+    expect(phone.source).toBe('bundled');
+    expect(phone.weightsBytes).toBe(277996288);
+    expect(phone.files.filter((f) => f.file.endsWith('.bin')).length).toBe(8);
+    // GitHub 100MB 硬限：入库档任何分片都不得超
+    for (const f of phone.files) expect(f.bytes).toBeLessThanOrEqual(100 * 1024 * 1024);
+  });
+
+  it('remote tiers declare real sha256 contracts and stay out of the bundle', () => {
+    for (const tier of ['chinese', 'uncensored'] as const) {
+      const model = WEBLLM_MODELS[tier];
+      expect(model.source).toBe('remote');
+      expect(model.remoteBaseUrl).toMatch(/^https:\/\/hf-mirror\.com\/.+\/resolve\/main\/$/);
+      const shards = model.files.filter((f) => f.file.endsWith('.bin'));
+      expect(shards.length).toBeGreaterThan(0);
+      for (const f of shards) expect(f.sha256, `${tier} ${f.file}`).toMatch(/^[0-9a-f]{64}$/);
+    }
   });
 
   it('base URLs follow the HF resolve/main mirror layout', () => {
-    expect(webLlmModelBaseUrl()).toMatch(/\/models\/mlc-ai\/Qwen2\.5-0\.5B-Instruct-q4f16_1-MLC\/$/);
-    expect(webLlmModelFilesBaseUrl()).toContain('/resolve/main/');
+    expect(webLlmModelBaseUrl()).toMatch(/\/models\/$/);
+    expect(modelWeightsBaseUrl(WEBLLM_MODELS.phone)).toContain('/resolve/main/');
+    expect(sameOriginKernelUrl(WEBLLM_MODELS.uncensored)).toMatch(/^http:\/\/localhost:\d+\/models\/.+\.wasm$/);
   });
 });

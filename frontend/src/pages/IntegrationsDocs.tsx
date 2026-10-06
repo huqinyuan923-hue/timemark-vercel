@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { ArrowLeft, Copy, Send, Smartphone } from 'lucide-react';
+import { ArrowLeft, Code2, Copy, Send, Smartphone } from 'lucide-react';
 import { api } from '@/lib/api';
 
 const SITE = typeof window !== 'undefined' ? window.location.origin : 'https://your-timemark.vercel.app';
@@ -65,7 +65,7 @@ export default function IntegrationsDocs() {
     <div className="min-h-screen p-6 max-w-3xl mx-auto pb-24">
       <Button variant="ghost" onClick={() => navigate(-1)} aria-label="返回"><ArrowLeft className="mr-2" size={18} aria-hidden />返回</Button>
       <h1 id="main-content" className="text-2xl font-bold mt-4 mb-2" tabIndex={-1}>集成与自动化文档</h1>
-      <p className="text-sm text-slate-500 mb-8">iOS 快捷指令、ntfy 推送、Zapier 与 Webhook 模板</p>
+      <p className="text-sm text-slate-500 dark:text-slate-400 mb-8">iOS 快捷指令、ntfy 推送、Zapier 与 Webhook 模板</p>
 
       <section className="mb-8 glass-panel p-6 rounded-2xl" aria-labelledby="ios-shortcuts-heading">
         <h2 id="ios-shortcuts-heading" className="text-lg font-semibold mb-2 flex items-center gap-2">
@@ -76,7 +76,7 @@ export default function IntegrationsDocs() {
         </p>
 
         <h3 className="text-sm font-bold mb-2">步骤 1：获取 Webhook URL</h3>
-        <p className="text-xs text-slate-500 mb-2">在「设置 → 集成」复制 Webhook 入站 URL，或下方只读字段：</p>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">在「设置 → 集成」复制 Webhook 入站 URL，或下方只读字段：</p>
         <Input readOnly value={webhookUrl || '加载中...'} className="font-mono text-xs mb-2" aria-label="Webhook 入站 URL" />
         {webhookUrl && (
           <Button variant="outline" size="sm" className="min-h-11 mb-4" onClick={() => copyText(webhookUrl, 'Webhook URL')}>
@@ -97,7 +97,7 @@ export default function IntegrationsDocs() {
         </Button>
 
         <h3 className="text-sm font-bold mb-2">步骤 3：列出事件 / 测试通知</h3>
-        <p className="text-xs text-slate-500 mb-2">API Key 可在「设置 → 安全与数据」生成；列出事件：</p>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">API Key 可在「设置 → 安全与数据」生成；列出事件：</p>
         <pre className="text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded overflow-x-auto mb-2" tabIndex={0}>{listEventsCurl}</pre>
         <pre className="text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded overflow-x-auto mb-2" tabIndex={0}>{testNotifyCurl}</pre>
         <p className="text-xs text-slate-400">
@@ -136,11 +136,11 @@ export default function IntegrationsDocs() {
 
         <div className="flex flex-wrap gap-2 items-end mb-2">
           <div className="flex-1 min-w-[140px]">
-            <label className="text-xs text-slate-500 block mb-1">服务器</label>
+            <label className="text-xs text-slate-500 dark:text-slate-400 block mb-1">服务器</label>
             <Input value={ntfyServer} onChange={(e) => setNtfyServer(e.target.value)} aria-label="ntfy 服务器地址" />
           </div>
           <div className="flex-1 min-w-[140px]">
-            <label className="text-xs text-slate-500 block mb-1">Topic</label>
+            <label className="text-xs text-slate-500 dark:text-slate-400 block mb-1">Topic</label>
             <Input value={ntfyTopic} onChange={(e) => setNtfyTopic(e.target.value)} placeholder="my-secret-topic" aria-label="ntfy Topic" />
           </div>
           <Button onClick={testNtfy} disabled={ntfyTesting} className="min-h-11">
@@ -162,7 +162,7 @@ export default function IntegrationsDocs() {
           <li>Redeploy 后，在「设置 → 集成」点击「连接 Google 日历」</li>
           <li>确认部署向导中数据库结构为 v27+</li>
         </ol>
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-slate-500 dark:text-slate-400">
           不想配 OAuth？在 Google 日历复制 ICS 秘密地址，粘贴到「外部 ICS 订阅 URL」即可。完整说明见仓库 <code className="text-xs">docs/GOOGLE_CALENDAR_OAUTH.md</code>。
         </p>
       </section>
@@ -174,6 +174,26 @@ export default function IntegrationsDocs() {
 Content-Type: application/json
 
 {"name":"会议","date":"2026-08-01","type":"meeting","daysBefore":[1]}`}</pre>
+      </section>
+
+      <section className="mb-8 glass-panel p-6 rounded-2xl" aria-labelledby="rest-api-heading">
+        <h2 id="rest-api-heading" className="text-lg font-semibold mb-2 flex items-center gap-2">
+          <Code2 size={20} aria-hidden /> REST API（v2.30 新增）
+        </h2>
+        <p className="text-sm text-slate-600 dark:text-slate-400 mb-3">
+          在 <strong>API 门户</strong> 创建 Token（默认只读，write 才能新建事件）后，用 <code className="font-mono text-xs">Authorization: Bearer tmt_…</code> 调用以下只读端点：
+        </p>
+        <pre className="text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded overflow-x-auto mb-3" tabIndex={0}>{`GET  /api/v1/events?from=2026-01-01&to=2026-12-31&limit=50
+GET  /api/v1/events/:id
+GET  /api/v1/expiry?within=30
+GET  /api/v1/habits
+GET  /api/v1/stats/daily?from=&to=
+POST /api/v1/events          # write scope`}</pre>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">
+          响应统一 <code className="font-mono">{'{ success, data | error }'}</code>；每 Token 限速 120 次/分钟（429 带 Retry-After）；每次调用可在 API 门户看到审计流水。
+        </p>
+        <pre className="text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded overflow-x-auto" tabIndex={0}>{`curl -H "Authorization: Bearer tmt_xxx" \\
+  "${SITE}/api/v1/events?limit=10"`}</pre>
       </section>
 
       <section className="glass-panel p-6 rounded-2xl" aria-labelledby="bookmarklet-heading">

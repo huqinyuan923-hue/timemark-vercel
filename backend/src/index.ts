@@ -2,7 +2,29 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { cors } from 'hono/cors';
-import { logger as honoLogger } from 'hono/logger';
+import { readFileSync } from 'node:fs';
+
+// v2.28 C16：应用版本单一来源 = 根 package.json；读取失败回退 dev 标记
+// v2.30 修复：Vercel 生产 bundle 是 esbuild CJS，`import.meta` 为空对象——
+// 原先的 `createRequire(import.meta.url)` 在模块求值期即抛错，整个函数冷启动
+// 崩溃（500 FUNCTION_INVOCATION_FAILED，v2.28 部署后全站 API 不可用的根因）。
+// bundle 由 build-vercel-api.mjs banner 注入 process.env.APP_VERSION，优先取之；
+// 本地 dev（tsx ESM）无该值，按 cwd 回退读 package.json。
+const APP_VERSION: string =
+  process.env.APP_VERSION ||
+  (() => {
+    try {
+      // pnpm dev:backend 的 cwd = backend/ → 根 package.json 在上一级
+      for (const p of ['../package.json', '../../package.json', 'package.json']) {
+        try {
+          return String((JSON.parse(readFileSync(p, 'utf8')) as { version?: string }).version ?? 'dev');
+        } catch { /* try next path */ }
+      }
+      return 'dev';
+    } catch {
+      return 'dev';
+    }
+  })();
 import { requestIdMiddleware } from './middleware/request-id.js';
 import { securityHeaders } from './middleware/security-headers.js';
 import { zeroTrustGuard } from './middleware/zero-trust-guard.js';
@@ -15,7 +37,7 @@ import { createLogger } from './utils/logger.js';
 import { waitForDb, query } from './db/index.js';
 import { runMigrations, migrateEncryptionKey } from './db/migrate.js';
 import { initSecretKeys } from './utils/secrets.js';
-import { isTurnstileEnabled } from './utils/turnstile.js';
+import { isTurnstileEnabled, getTurnstileSiteKey } from './utils/turnstile.js';
 import { getClockOffsetMs, getLastTimeSyncResult, scheduleTimeSync, DEFAULT_SYNC_TIMEZONE } from './utils/ntp.js';
 import { getCronSecret } from './utils/heartbeat.js';
 import { inferDatabaseRegionHint, isPreferredCnVercelRegion } from './utils/infra-region.js';
@@ -49,6 +71,7 @@ import resendWebhookRoutes from './routes/resend-webhook.js';
 import conditionalRulesRoutes from './routes/conditional-rules.js';
 import todosRoutes from './routes/todos.js';
 import cspReportRoutes from './routes/csp-report.js';
+import greetingsRoutes from './routes/greetings.js';
 import timeRoutes from './routes/time.js';
 import expiryRoutes from './routes/expiry.js';
 import inventoryRoutes from './routes/inventory.js';
@@ -67,6 +90,7 @@ import botRoutes from './routes/bot.js';
 import aiRoutes from './routes/ai.js';
 import searchRoutes from './routes/search.js';
 import agentTokensRoutes from './routes/agent-tokens.js';
+import apiPortalRoutes from './routes/api-portal.js';
 import agentRoutes from './routes/agent.js';
 // checkbox 103: stateless MCP server over the Streamable HTTP transport (disabled unless
 // MCP_ENABLED=true); a single POST handler over the same scoped tokens + tool registry.
@@ -90,6 +114,8 @@ import dedupeRoutes from './routes/dedupe.js';
 import auditRoutes from './routes/audit.js';
 // task 137: data-health report + one-click idempotent repairs (migration v65).
 import dataHealthRoutes from './routes/data-health.js';
+// v2.26: retention policy view + manual purge + digest archive list.
+import retentionRoutes from './routes/retention.js';
 // task 139: notification-channel repair checks/actions.
 import channelRepairRoutes from './routes/channel-repair.js';
 // tasks 140/141: recurring routine templates (migration v67).
@@ -147,7 +173,13 @@ const app = new Hono();
 const isTelegramWebhook = (c: { req: { method: string; path: string } }): boolean =>
   c.req.method === 'POST' && c.req.path === '/api/bot/telegram';
 
-app.use('*', honoLogger());
+// v2.27 C-9：全局兜底错误处理——未捕获异常统一返回 {success,error} JSON 500
+//（此前是 Hono 默认纯文本，前端拿到的是非 JSON 而直接报「请求失败」）。
+app.onError((err, c) => {
+  console.error('[unhandled]', c.req.method, c.req.path, err);
+  return c.json({ success: false, error: '服务器内部错误，请稍后重试' }, 500);
+});
+
 app.use('*', async (c, next) => (isTelegramWebhook(c) ? next() : zeroTrustGuard(c, next)));
 app.use('*', securityHeaders);
 app.use('/api/*', httpsEnforcement);
@@ -200,6 +232,7 @@ app.route('/api/push', pushRoutes);
 app.route('/api/cron', cronRoutes);
 app.route('/api/data', dataRoutes);
 app.route('/api/trigger-logs', triggerLogRoutes);
+app.route('/api/greetings', greetingsRoutes);
 app.route('/api/user', userRoutes);
 app.route('/api/features', featuresRoutes);
 app.route('/api/security', securityRoutes);
@@ -258,6 +291,8 @@ app.route('/api/agent/scheduler', agentSchedulerRoutes);
 app.route('/api/agent', agentRoutes);
 // checkbox 103: stateless MCP server (Streamable HTTP) over the same registry + scoped tokens.
 app.route('/api/mcp', mcpRoutes);
+// v2.30 方向 B: 对外 REST API（/api/v1/*，tmt_ token 鉴权，与 MCP 同源）。
+app.route('/api/v1', apiPortalRoutes);
 // checkbox 119: the agent control-plane API (jobs, workers, routines; session/admin auth only).
 app.route('/api/admin/agent', adminAgentRoutes);
 // task 138: migration self-check (recorded schema version vs the migrate.ts tail).
@@ -273,6 +308,8 @@ app.route('/api/dedupe', dedupeRoutes);
 app.route('/api/audit', auditRoutes);
 // task 137: data-health report + one-click idempotent repairs.
 app.route('/api/data-health', dataHealthRoutes);
+// v2.26: retention policy view + manual purge + digest archive list.
+app.route('/api/retention', retentionRoutes);
 // task 139: notification-channel repair checks / actions.
 app.route('/api/channel-repair', channelRepairRoutes);
 // tasks 140/141: recurring routine templates.
@@ -319,9 +356,14 @@ app.get('/api/health', async (c) => {
   const detailed = c.req.query('detailed') === '1' && c.req.header('x-health-token') === process.env.HEALTH_DETAIL_TOKEN;
   const checks: Record<string, boolean | string> = {
     platform: process.env.VERCEL ? 'vercel' : 'local',
-    version: '2.16.0',
+    // v2.28：版本从 package.json 注入（原硬编码 2.16.0 已与发布脱节）
+    version: APP_VERSION,
     database: false,
-    turnstile: isTurnstileEnabled(),
+    // v2.30：拆成三维——只看 Secret 时，SiteKey 丢失会让面板全绿而登录页验证
+    // 消失、登录被拒（生产事故复盘）。`turnstile` 现在只在"完整可用"时为 true。
+    turnstile: !!getTurnstileSiteKey() && isTurnstileEnabled(),
+    turnstileSiteKey: !!getTurnstileSiteKey(),
+    turnstileSecret: isTurnstileEnabled(),
   };
   if (process.env.VERCEL) {
     const fnRegion = process.env.VERCEL_REGION || 'unknown';
@@ -351,8 +393,11 @@ app.get('/api/health', async (c) => {
     checks.timeSource = cachedTime?.source ?? 'system';
     scheduleTimeSync(DEFAULT_SYNC_TIMEZONE);
 
+    // v2.26: 读有界的 cron_job_status（每 job 一行 upsert）——旧查询在 26 万行的
+    // cron_execution_logs 上全表排序，是 /api/health 的慢路径。
     const lastCron = await query(
-      `SELECT job_name, status, executed_at FROM cron_execution_logs ORDER BY executed_at DESC LIMIT 1`,
+      `SELECT job_name, last_status AS status, updated_at AS executed_at
+       FROM cron_job_status ORDER BY updated_at DESC LIMIT 1`,
     ).catch(() => ({ rows: [] }));
     if (detailed && process.env.HEALTH_DETAIL_TOKEN && lastCron.rows[0]) {
       checks.lastCronJob = lastCron.rows[0].job_name;
@@ -449,6 +494,16 @@ async function bootstrap() {
   log.info({ port }, 'Server running');
   serve({ fetch: app.fetch, port });
 }
+
+// v2.30 硬化（全链路实测踩坑）：渠道发送链出过一次 fromPromise unhandledRejection
+// 直接击穿本地进程。进程级兜底只记日志不退出——单条通知的意外拒绝不该拖死
+// 正在服务的其他请求；真正的缺陷仍要沿日志里的 event/stack 修。
+process.on('unhandledRejection', (reason) => {
+  log.error({ event: 'process.unhandled_rejection', err: reason }, 'Unhandled rejection (logged, process kept alive)');
+});
+process.on('uncaughtException', (err) => {
+  log.fatal(err, 'Uncaught exception (logged, process kept alive)');
+});
 
 // Local/Docker: bootstrap the full app (DB init, scheduler, HTTP server)
 if (!process.env.VERCEL) {

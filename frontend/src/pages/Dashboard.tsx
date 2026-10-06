@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuthStore } from '@/stores/auth.store';
 import { useEventStore } from '@/stores/event.store';
@@ -14,12 +14,14 @@ import { useProfileStore } from '@/stores/profile.store';
 import type { Event, CreateEventRequest } from '@timemark/shared';
 import { Settings, Bell, Plus, Download, Calendar, BarChart2, ListChecks, Shield, Upload, Users, Mail, Inbox, AlarmClock, Package, Wrench, Target } from 'lucide-react';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
+import { Skeleton } from '@/components/ui/skeleton-card';
 import { api } from '@/lib/api';
 import { prefetchRoute } from '@/lib/prefetch-routes';
 import { getTodoEvents, isEventToday } from '@/lib/calendar-utils';
 import { useTodoCompletions } from '@/hooks/useTodoCompletions';
 import { AlmanacCard } from '@/components/almanac/AlmanacCard';
 import { TimeMachineCard } from '@/components/dashboard/TimeMachineCard';
+import { RecentNotificationsCard } from '@/components/dashboard/RecentNotifications';
 
 const containerVariants = { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.05 } } };
 const itemVariants = { hidden: { opacity: 0, y: 10 }, visible: { opacity: 1, y: 0, transition: { duration: 0.2 } } };
@@ -35,7 +37,21 @@ export function Dashboard() {
   const [batchMode, setBatchMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [conflicts, setConflicts] = useState<{ date: string; count: number; names: string[] }[]>([]);
+  // v2.27：冲突列表默认只显 3 组，可展开
+  const [showAllConflicts, setShowAllConflicts] = useState(false);
   const [inboxUnread, setInboxUnread] = useState(0);
+  // v2.25: 静默时段状态提示——静默中的通知不丢（cron 照常投递记录），只是延迟到窗口结束
+  const [quietHours, setQuietHours] = useState<{ start: string | null; end: string | null } | null>(null);
+
+  useEffect(() => {
+    api.get<{ quiet_hours_start?: string | null; quiet_hours_end?: string | null }>('/config')
+      .then((cfg) => {
+        if (cfg?.quiet_hours_start && cfg?.quiet_hours_end) {
+          setQuietHours({ start: cfg.quiet_hours_start, end: cfg.quiet_hours_end });
+        }
+      })
+      .catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     prefetchRoute('/inbox');
@@ -65,23 +81,43 @@ export function Dashboard() {
 
   const { completedKeys } = useTodoCompletions();
   const { timezone } = useTimezone();
-  const todoCount = getTodoEvents(events, new Date(), completedKeys, timezone).length;
-  const todayCount = events.filter((e) => isEventToday(e, new Date(), timezone)).length;
+  // v2.27 B-1：按天稳定化的 dayKey + useMemo —— 此前每次渲染都重跑 O(n) 窗口计算
+  const dayKey = `${new Date().getFullYear()}-${new Date().getMonth()}-${new Date().getDate()}`;
+  const todoCount = useMemo(
+    () => getTodoEvents(events, new Date(), completedKeys, timezone).length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [events, completedKeys, timezone, dayKey],
+  );
+  const todayCount = useMemo(
+    () => events.filter((e) => isEventToday(e, new Date(), timezone)).length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [events, timezone, dayKey],
+  );
+
+  // v2.30：ICS 导入结果用行内横幅替代 alert（不打断、可复查、自动消失）
+  const [icsStatus, setIcsStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
   const handleImportIcs = async (file: File) => {
-    const text = await file.text();
-    const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
-    const res = await fetch('/api/calendar/import-ics', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/calendar' },
-      body: text,
-    });
-    const data = await res.json();
-    if (data.success) {
-      alert(`已导入 ${data.data.imported} 个事件`);
-      fetchEvents();
-    } else {
-      alert(data.error || '导入失败');
+    // v2.27：整个导入路径包 try/catch —— 此前 fetch/json 失败是 unhandled rejection，UI 无反馈
+    try {
+      const text = await file.text();
+      const token = localStorage.getItem('accessToken') || sessionStorage.getItem('accessToken');
+      const res = await fetch('/api/calendar/import-ics', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/calendar' },
+        body: text,
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        setIcsStatus({ ok: true, text: `已导入 ${data.data.imported} 个事件` });
+        fetchEvents();
+      } else {
+        setIcsStatus({ ok: false, text: data?.error || `导入失败（HTTP ${res.status}）` });
+      }
+    } catch (e) {
+      setIcsStatus({ ok: false, text: e instanceof Error ? e.message : '导入失败' });
+    } finally {
+      setTimeout(() => setIcsStatus(null), 6000);
     }
   };
 
@@ -178,7 +214,7 @@ export function Dashboard() {
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen pb-24">
       <header className="sticky top-4 z-50 px-4 max-w-7xl mx-auto" role="banner" aria-label="页面顶部导航">
         <div className="glass-panel rounded-full px-6 py-3 flex justify-between items-center ring-1 ring-white/20 dark:ring-white/10">
-          <div className="flex items-center gap-4 alive-interactive" onClick={() => navigate('/dashboard')} role="button" tabIndex={0} aria-label="返回首页" onKeyDown={(e) => e.key === 'Enter' && navigate('/dashboard')}>
+          <div className="flex items-center gap-4 alive-interactive" onClick={() => navigate('/dashboard')} role="button" tabIndex={0} aria-label="返回首页" onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && navigate('/dashboard')}>
             <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-primary-500 to-purple-500 flex items-center justify-center shadow-lg" aria-hidden>
               <span className="text-white font-bold text-xl">T</span>
             </div>
@@ -236,9 +272,43 @@ export function Dashboard() {
         </div>
       </header>
 
+      {/* v2.30：ICS 导入结果行内横幅（替代 alert） */}
+      {icsStatus && (
+        <div
+          role="status"
+          className={`max-w-7xl mx-auto px-6 mt-2 rounded-xl px-4 py-2 text-sm ${
+            icsStatus.ok
+              ? 'border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/60 dark:bg-emerald-900/10 text-emerald-700 dark:text-emerald-300'
+              : 'border border-red-200 dark:border-red-900/50 bg-red-50/60 dark:bg-red-900/10 text-red-600 dark:text-red-300'
+          }`}
+        >
+          {icsStatus.text}
+        </div>
+      )}
+
       <main id="main-content" className="max-w-7xl mx-auto px-6 py-8 mt-4" tabIndex={-1}>
+        {(() => {
+          // v2.25: 静默时段横幅（本地时间在窗口内时显示；窗口跨午夜也支持）
+          if (!quietHours?.start || !quietHours?.end) return null;
+          const toMin = (t: string): number => {
+            const [h, m] = t.split(':').map(Number);
+            if (!Number.isFinite(h) || !Number.isFinite(m)) return NaN;
+            return h * 60 + m;
+          };
+          const s = toMin(quietHours.start);
+          const e = toMin(quietHours.end);
+          if (!Number.isFinite(s) || !Number.isFinite(e)) return null;
+          const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+          const inQuiet = s <= e ? nowMin >= s && nowMin < e : nowMin >= s || nowMin < e;
+          if (!inQuiet) return null;
+          return (
+            <div className="mb-4 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/50 px-4 py-2.5 text-sm text-indigo-700 dark:text-indigo-300 flex items-center gap-2" role="status">
+              🌙 静默时段（{quietHours.start}–{quietHours.end}）：提醒会在窗口结束后补发，不会丢失。
+            </div>
+          );
+        })()}
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-          <div className="glass-panel rounded-2xl p-4"><p className="text-xs text-slate-500">今日事件</p><p className="text-2xl font-bold">{todayCount}</p></div>
+          <div className="glass-panel rounded-2xl p-4"><p className="text-xs text-slate-500 dark:text-slate-400">今日事件</p><p className="text-2xl font-bold">{todayCount}</p></div>
           <div
             className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-amber-400/50 transition"
             onClick={() => navigate('/todos')}
@@ -246,21 +316,21 @@ export function Dashboard() {
             tabIndex={0}
             onKeyDown={(e) => e.key === 'Enter' && navigate('/todos')}
           >
-            <p className="text-xs text-slate-500">近期待办</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400">近期待办</p>
             <p className="text-2xl font-bold">{todoCount}</p>
             <p className="text-[10px] text-slate-400 mt-1">进入提醒窗口的事件</p>
           </div>
-          <div className="glass-panel rounded-2xl p-4"><p className="text-xs text-slate-500">总事件</p><p className="text-2xl font-bold">{events.length}</p></div>
-          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-emerald-400/50 transition" onClick={() => navigate('/contacts')}>
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Users size={12} />固定联系人</p>
+          <div className="glass-panel rounded-2xl p-4"><p className="text-xs text-slate-500 dark:text-slate-400">总事件</p><p className="text-2xl font-bold">{events.length}</p></div>
+          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-emerald-400/50 transition" onClick={() => navigate('/contacts')} role="button" tabIndex={0} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && navigate('/contacts')}>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Users size={12} />固定联系人</p>
             <p className="text-sm font-medium text-emerald-600">管理 →</p>
           </div>
-          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-blue-400/50 transition" onClick={() => navigate('/broadcast')}>
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Mail size={12} />批量邮件</p>
+          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-blue-400/50 transition" onClick={() => navigate('/broadcast')} role="button" tabIndex={0} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && navigate('/broadcast')}>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Mail size={12} />批量邮件</p>
             <p className="text-sm font-medium text-blue-600">群发 →</p>
           </div>
-          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-indigo-400/50 transition" onClick={() => navigate('/calendar')}>
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Calendar size={12} />日历视图</p>
+          <div className="glass-panel rounded-2xl p-4 cursor-pointer hover:ring-2 hover:ring-indigo-400/50 transition" onClick={() => navigate('/calendar')} role="button" tabIndex={0} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && navigate('/calendar')}>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Calendar size={12} />日历视图</p>
             <p className="text-sm font-medium text-indigo-600">查看 →</p>
           </div>
           <div
@@ -270,7 +340,7 @@ export function Dashboard() {
             tabIndex={0}
             onKeyDown={(e) => e.key === 'Enter' && navigate('/expiry')}
           >
-            <p className="text-xs text-slate-500 flex items-center gap-1"><AlarmClock size={12} />到期中心</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><AlarmClock size={12} />到期中心</p>
             <p className="text-sm font-medium text-rose-600">管理 →</p>
           </div>
           <div
@@ -280,7 +350,7 @@ export function Dashboard() {
             tabIndex={0}
             onKeyDown={(e) => e.key === 'Enter' && navigate('/inventory')}
           >
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Package size={12} />库存</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Package size={12} />库存</p>
             <p className="text-sm font-medium text-teal-600">管理 →</p>
           </div>
           <div
@@ -290,7 +360,7 @@ export function Dashboard() {
             tabIndex={0}
             onKeyDown={(e) => e.key === 'Enter' && navigate('/maintenance')}
           >
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Wrench size={12} />保养</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Wrench size={12} />保养</p>
             <p className="text-sm font-medium text-orange-600">管理 →</p>
           </div>
           <div
@@ -301,7 +371,7 @@ export function Dashboard() {
             data-testid="nav-goals"
             onKeyDown={(e) => e.key === 'Enter' && navigate('/goals')}
           >
-            <p className="text-xs text-slate-500 flex items-center gap-1"><Target size={12} />目标</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1"><Target size={12} />目标</p>
             <p className="text-sm font-medium text-violet-600">管理 →</p>
           </div>
         </div>
@@ -311,16 +381,26 @@ export function Dashboard() {
         <div className="mb-6">
           <TimeMachineCard />
         </div>
+        {/* v2.27 遗留2：近期通知时间线（/trigger-logs 最近 6 条，空/失败静默隐藏） */}
+        <RecentNotificationsCard />
         {conflicts.length > 0 && (
           <div className="mb-6 glass-panel rounded-2xl p-4 border border-amber-200/60 dark:border-amber-800/40 bg-amber-50/50 dark:bg-amber-900/10">
             <p className="text-sm font-bold text-amber-800 dark:text-amber-200 mb-2">⚠️ 日期冲突检测（{conflicts.length} 组）</p>
             <div className="space-y-1">
-              {conflicts.slice(0, 3).map((c) => (
+              {(showAllConflicts ? conflicts : conflicts.slice(0, 3)).map((c) => (
                 <p key={c.date} className="text-xs text-amber-700 dark:text-amber-300">
                   {c.date}：{c.names?.join('、') || `${c.count} 个事件`}
                 </p>
               ))}
-              {conflicts.length > 3 && <p className="text-xs text-amber-600">还有 {conflicts.length - 3} 组冲突…</p>}
+              {conflicts.length > 3 && (
+                <button
+                  type="button"
+                  className="text-xs text-amber-600 dark:text-amber-400 underline"
+                  onClick={() => setShowAllConflicts((v) => !v)}
+                >
+                  {showAllConflicts ? '收起' : `查看全部 ${conflicts.length} 组`}
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -348,11 +428,7 @@ export function Dashboard() {
         {loading ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {[1, 2, 3, 4, 5, 6].map((i) => (
-              <div key={i} className="glass rounded-3xl p-6 animate-pulse h-48">
-                <div className="h-5 bg-slate-300/50 dark:bg-slate-700/50 rounded-full w-2/3 mb-6"></div>
-                <div className="h-12 bg-slate-300/50 dark:bg-slate-700/50 rounded-2xl w-full mb-4"></div>
-                <div className="h-4 bg-slate-300/50 dark:bg-slate-700/50 rounded-full w-1/3"></div>
-              </div>
+              <Skeleton key={i} className="glass rounded-3xl p-6 h-48" />
             ))}
           </div>
         ) : events.length === 0 ? (

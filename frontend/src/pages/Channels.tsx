@@ -10,13 +10,17 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Webhook, MessageSquare, AlertCircle, CheckCircle2,
   Link2Off, ArrowLeft, Plus, ExternalLink, Settings,
-  BookOpen, ChevronRight,
+  BookOpen, ChevronRight, Search,
   Loader2, Activity
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { SkeletonCard } from '@/components/ui/skeleton-card';
+import { ChannelRepairWizard } from '@/components/channels/ChannelRepairWizard';
 import { fetchChannelTemplates, type CloudChannelTemplate } from '@/lib/channel-templates';
 import { ChannelIcon } from '@/components/channels/ChannelIcon';
+import { ChannelQr } from '@/components/channels/ChannelQr';
 import type { NotificationAccount } from '@timemark/shared';
 
 // Channel configuration method types (cloud deploy: webhook + token only)
@@ -33,6 +37,8 @@ interface Account extends NotificationAccount {
   tokenConfigured?: boolean;
   secretConfigured?: boolean;
   sessionConfigured?: boolean;
+  webhookConfigured?: boolean;
+  chatIdConfigured?: boolean;
   last_test_result?: 'success' | 'failed' | null;
   last_test_at?: string | null;
   connection_status?: string | null;
@@ -75,6 +81,7 @@ export default function Channels() {
   /** 请求进行中又来了一次刷新：排一次尾随刷新，而不是丢掉它 */
   const trailingRef = useRef(false);
   const [activeTab, setActiveTab] = useState<ConfigMethod>('webhook');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
   
   // Modal navigation state - track the flow: list -> template -> config -> qr
   const [modalBackStack, setModalBackStack] = useState<string[]>([]);
@@ -89,6 +96,9 @@ export default function Channels() {
   const [testingConnection, setTestingConnection] = useState<string | null>(null);
   const [testingConfig, setTestingConfig] = useState(false);
   const [configTestMessage, setConfigTestMessage] = useState<string | null>(null);
+  // v2.28：三步向导 —— 配置弹窗内 ②填写 → ③测试并保存（①选渠道复用现有类型弹窗）
+  const [wizardStep, setWizardStep] = useState<1 | 2>(1);
+  const [directTestResult, setDirectTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Connection status tracking
   interface ConnectionTestResult {
@@ -101,6 +111,8 @@ export default function Channels() {
   const [testAllSummary, setTestAllSummary] = useState('');
   const [channelStats, setChannelStats] = useState<Array<{ channel: string; sent: number; ok: number; failed: number; successRate: number }>>([]);
   const [accountStats, setAccountStats] = useState<Record<number, { sent: number; ok: number; failed: number; successRate: number }>>({});
+  // v2.25: 修复向导——暂停徽章的第二个动作（第一个是立即恢复）
+  const [repairAccountId, setRepairAccountId] = useState<number | null>(null);
   const [statsRuns, setStatsRuns] = useState(0);
 
   const fetchStats = () => {
@@ -292,6 +304,8 @@ export default function Channels() {
     setSelectedTemplate(template);
     setShowTemplateModal(false);
     setConfigTestMessage(null);
+    setWizardStep(1);
+    setDirectTestResult(null);
     
     const initialForm: Record<string, string> = { name: '' };
     template.fields.forEach(field => {
@@ -308,6 +322,53 @@ export default function Channels() {
       setModalBackStack([...modalBackStack, 'template', 'config']);
       setShowConfigModal(true);
     }, 0);
+  };
+
+  // v2.28：三步向导的必填校验（编辑模式下已配置的密文字段留空 = 不修改，视为已填）
+  const missingRequiredFields = (selectedTemplate?.fields ?? [])
+    .filter((f) => {
+      if (!f.required) return false;
+      const v = (configForm[f.name] || '').trim();
+      if (v) return false;
+      if (f.name === 'token') return !selectedAccount?.tokenConfigured;
+      if (f.name === 'secret') return !selectedAccount?.secretConfigured;
+      // v2.28 修复：webhook/chat_id 已配置的渠道（后端置 null + *Configured 标志）
+      // 在编辑模式下留空 = 保持不变，不能把向导锁死
+      if (f.name === 'webhook') return !selectedAccount?.webhookConfigured;
+      if (f.name === 'chat_id') return !selectedAccount?.chatIdConfigured;
+      return true;
+    })
+    .map((f) => f.label);
+
+  // v2.28：保存前直测（/channels/test 支持不带 accountId 的直连配置测试，SMTP 同款）
+  const testConfigDirect = async () => {
+    if (!selectedTemplate) return;
+    setTestingConfig(true);
+    setDirectTestResult(null);
+    try {
+      const payload: Record<string, unknown> = {
+        type: selectedTemplate.id,
+        configMethod: selectedTemplate.configMethod,
+      };
+      for (const field of selectedTemplate.fields) {
+        const dest = field.column ?? field.name;
+        const value = (configForm[field.name] || '').trim();
+        if (!value) continue;
+        if (dest === 'webhook') payload.webhook = value;
+        else if (dest === 'token') payload.token = value;
+        else if (dest === 'secret') payload.secret = value;
+        else if (dest === 'chat_id') payload.chatId = value;
+      }
+      if (selectedAccount?.id) payload.accountId = Number(selectedAccount.id);
+      // v2.29：后端回传 latency（毫秒），成功提示里顺带展示响应速度
+      const result = await api.post<{ success: boolean; message: string; latency?: number }>('/channels/test', payload);
+      const latencySuffix = typeof result?.latency === 'number' ? `（${result.latency}ms）` : '';
+      setDirectTestResult({ ok: true, message: `${result?.message || '测试连接成功'}${latencySuffix}` });
+    } catch (error: any) {
+      setDirectTestResult({ ok: false, message: error?.message || '测试连接失败' });
+    } finally {
+      setTestingConfig(false);
+    }
   };
 
   // Handle going back in modal navigation
@@ -336,7 +397,10 @@ export default function Channels() {
     setSelectedAccount(account);
     setConfigForm(buildConfigFormFromAccount(account, template));
     setConfigTestMessage(null);
-    
+    // v2.28 修复：编辑也要从步骤①开始，否则会落在上一次残留的测试结果页
+    setWizardStep(1);
+    setDirectTestResult(null);
+
     // Set modal back stack properly so cancel returns to main, not template
     setModalBackStack(['main', 'config']);
     setShowConfigModal(true);
@@ -578,10 +642,40 @@ export default function Channels() {
 
   const filteredTemplates = templates.filter(t => t.configMethod === activeTab);
 
+  // v2.29：61 个渠道靠翻已经翻不动，加名称/描述/ID 实时搜索；与分类筛选叠加
+  const [templateSearch, setTemplateSearch] = useState('');
+  const searchedTemplates = templateSearch.trim()
+    ? filteredTemplates.filter((t) => {
+        const kw = templateSearch.trim().toLowerCase();
+        return (
+          t.name.toLowerCase().includes(kw) ||
+          t.description.toLowerCase().includes(kw) ||
+          t.id.toLowerCase().includes(kw)
+        );
+      })
+    : filteredTemplates;
+
+  // 分类过滤 + 分组（v2.29）：61 个渠道平铺已经翻不动了，按类分组 + 类别筛选
+  const categoryOrder = ['im', 'push', 'email', 'sms', 'smart', 'automation', 'other'] as const;
+  const CATEGORY_LABELS: Record<string, string> = {
+    im: '即时通讯', push: '推送通知', email: '邮件', sms: '短信 / 电话',
+    smart: '智能家居 / 自托管', automation: '自动化平台', other: '其他',
+  };
+  const groupedTemplates = categoryOrder
+    .map((cat) => ({
+      category: cat,
+      label: CATEGORY_LABELS[cat],
+      items: searchedTemplates.filter((t) => (t.category ?? 'other') === cat),
+    }))
+    .filter((group) => group.items.length > 0)
+    .filter((group) => categoryFilter === 'all' || group.category === categoryFilter);
+
   const connectedAccounts = accounts.filter(a => getAccountStatus(a) === 'connected');
   const failedAccounts = accounts.filter(a => getAccountStatus(a) === 'failed');
   const untestedAccounts = accounts.filter(a => getAccountStatus(a) === 'untested');
   const disabledAccounts = accounts.filter(a => getAccountStatus(a) === 'disabled');
+  // v2.30：24h 失败暂停中的账户（3 连败自动暂停，健康总览里一眼看出谁在休眠）
+  const suspendedAccounts = accounts.filter(isAccountSuspended);
 
   /**
    * 邮件送达健康检查卡（v78）：邮件进垃圾箱的根因几乎都在发件域名的认证配置，
@@ -611,6 +705,26 @@ export default function Channels() {
     }
   };
 
+  // v2.25: 渠道统计导出 CSV（按渠道 + 按账户两个 sheet 段）
+  const exportStatsCsv = () => {
+    const esc = (v: string | number): string => `"${String(v).replace(/"/g, '""')}"`;
+    const lines = ['section,channel_or_account,sent,ok,failed,success_rate'];
+    for (const s of channelStats) {
+      lines.push([ 'channel', esc(s.channel), s.sent, s.ok, s.failed, s.successRate ].join(','));
+    }
+    for (const [id, a] of Object.entries(accountStats)) {
+      const account = accounts.find((acc) => Number(acc.id) === Number(id));
+      lines.push([ 'account', esc(account?.name || `#${id}`), a.sent, a.ok, a.failed, a.successRate ].join(','));
+    }
+    const blob = new Blob(['\uFEFF' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `timemark-channel-stats-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const renderChannelStatsCard = () => {
     if (channelStats.length === 0) return null;
     const totals = channelStats.reduce((acc, s) => ({ sent: acc.sent + s.sent, ok: acc.ok + s.ok }), { sent: 0, ok: 0 });
@@ -627,6 +741,14 @@ export default function Channels() {
             {statsRuns > 0 && (
               <span className="text-xs text-slate-400 font-normal">共 {statsRuns} 次分发（最多统计最近 5000 条日志）</span>
             )}
+            <button
+              type="button"
+              onClick={exportStatsCsv}
+              className="ml-auto text-xs text-primary-600 dark:text-primary-400 underline hover:no-underline"
+              aria-label="导出渠道统计 CSV"
+            >
+              导出 CSV
+            </button>
           </h2>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 mt-4">
             {channelStats.map((s) => {
@@ -661,7 +783,7 @@ export default function Channels() {
             if (accountEntries.length === 0) return null;
             return (
               <div className="mt-4 pt-4 border-t border-slate-200/60 dark:border-slate-700/50">
-                <p className="text-xs font-semibold text-slate-500 mb-2">按账户</p>
+                <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-2">按账户</p>
                 <div className="flex flex-wrap gap-2">
                   {accountEntries.map(([id, stat]) => {
                     const account = accounts.find((a) => Number(a.id) === Number(id));
@@ -758,14 +880,24 @@ export default function Channels() {
                     </span>
                   )}
                   {account.is_active !== false && isAccountSuspended(account) && (
-                    <button
-                      type="button"
-                      onClick={() => resumeAccount(account)}
-                      className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60 transition-colors"
-                      title="连续发送失败，已暂停投递 24 小时；点击立即恢复投递"
-                    >
-                      ⏸ 暂停中 · 点击恢复
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => resumeAccount(account)}
+                        className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60 transition-colors"
+                        title="连续发送失败，已暂停投递 24 小时；点击立即恢复投递"
+                      >
+                        ⏸ 暂停中 · 点击恢复
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRepairAccountId(Number(account.id))}
+                        className="text-xs px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                        title="打开渠道修复向导：诊断 → 换凭据 → 重新启用"
+                      >
+                        🔧 修复
+                      </button>
+                    </>
                   )}
                   {connectionStatus[account.id]?.timestamp && (
                     <span className="text-[10px] text-slate-400" title={connectionStatus[account.id]?.message}>
@@ -785,6 +917,12 @@ export default function Channels() {
           <div className="flex items-center justify-between pt-4 border-t border-slate-200/60 dark:border-slate-700/50">
             <span className="text-xs text-slate-500 dark:text-slate-400">
               类型: {template?.name || account.type}
+              {/* v2.29：账户卡上直接标渠道分类，61 个渠道里一眼看出归属 */}
+              {template?.category && (
+                <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+                  {CATEGORY_LABELS[template.category] ?? '其他'}
+                </span>
+              )}
               {(() => {
                 // v79: 账户维度的真实发送统计 + 上次测试时间
                 const stat = accountStats[Number(account.id)];
@@ -840,17 +978,11 @@ export default function Channels() {
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen pb-24">
-      <header className="sticky top-6 z-40 px-4 max-w-[90rem] mx-auto" role="banner">
-        <div className="glass-panel rounded-full px-6 py-3.5 flex justify-between items-center ring-1 ring-black/5 dark:ring-white/10 shadow-xs">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="icon" className="rounded-full min-h-11 min-w-11" onClick={() => navigate(-1)} aria-label="返回上一页">
-              <ArrowLeft size={20} aria-hidden />
-            </Button>
-            <div>
-              <h1 className="text-xl font-bold text-slate-900 dark:text-white tracking-tight">通知渠道</h1>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">按需添加并绑定，不配置不影响核心提醒</p>
-            </div>
-          </div>
+      <PageHeader
+        title="通知渠道"
+        subtitle="按需添加并绑定，不配置不影响核心提醒"
+        maxWidth="max-w-[90rem]"
+        actions={
           <div className="flex items-center gap-2">
             {accounts.length > 0 && (
               <Button variant="outline" size="sm" className="rounded-full min-h-11 hidden sm:flex" onClick={exportAccounts} aria-label="导出脱敏渠道配置">
@@ -871,16 +1003,16 @@ export default function Channels() {
                 {testingAll ? '测试中...' : '全部测试'}
               </Button>
             )}
-            <Button 
-              variant="vision" 
-              className="shadow-md shadow-primary-500/20 flex rounded-full px-5" 
+            <Button
+              variant="vision"
+              className="shadow-md shadow-primary-500/20 flex rounded-full px-5"
               onClick={openTemplateModal}
             >
               <Plus size={16} className="mr-1.5"/> 添加渠道
             </Button>
           </div>
-        </div>
-      </header>
+        }
+      />
 
       <main id="main-content" className="max-w-[90rem] mx-auto px-6 py-10 mt-2" tabIndex={-1}>
         <p className="text-sm text-hint mb-8 max-w-3xl">
@@ -899,16 +1031,8 @@ export default function Channels() {
         {initialLoading ? (
           // 局部骨架：只在首屏出现，且形状与真实账户卡片一致，页面框架与说明文字不消失
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" aria-busy="true" aria-label="正在加载通知渠道">
-            {[1, 2, 3, 4, 5, 6].map((i) => (
-              <div key={i} className="glass-panel rounded-3xl p-6 ring-1 ring-black/5 dark:ring-white/10 animate-pulse">
-                <div className="flex items-center gap-3">
-                  <div className="w-12 h-12 rounded-xl bg-slate-200/60 dark:bg-slate-700/50" />
-                  <div className="flex-1 space-y-2">
-                    <div className="h-4 w-28 rounded-full bg-slate-200/60 dark:bg-slate-700/50" />
-                    <div className="h-3 w-20 rounded-full bg-slate-200/60 dark:bg-slate-700/50" />
-                  </div>
-                </div>
-              </div>
+            {Array.from({ length: 6 }, (_, i) => (
+              <SkeletonCard key={i} count={1} />
             ))}
           </div>
         ) : loadFailed ? (
@@ -921,6 +1045,49 @@ export default function Channels() {
           </div>
         ) : (
           <>
+            {/* v2.30：渠道健康总览条 —— 四色计数 + 暂停中账户提醒 */}
+            {accounts.length > 0 && (
+              <section className="mb-10">
+                <div className="glass-panel rounded-[2rem] px-6 py-4 ring-1 ring-black/5 dark:ring-white/10 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+                  <span className="font-semibold text-slate-700 dark:text-slate-200">健康总览</span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                    正常 <strong className="text-emerald-600 dark:text-emerald-400">{connectedAccounts.length}</strong>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
+                    未测试 <strong className="text-amber-600 dark:text-amber-400">{untestedAccounts.length}</strong>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500" />
+                    失败 <strong className="text-red-600 dark:text-red-400">{failedAccounts.length}</strong>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-slate-400" />
+                    已停用 <strong className="text-slate-500">{disabledAccounts.length}</strong>
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-orange-400" />
+                    暂停中 <strong className="text-orange-500">{suspendedAccounts.length}</strong>
+                  </span>
+                  {suspendedAccounts.length > 0 && (
+                    <span className="text-xs text-orange-600 dark:text-orange-300 basis-full flex flex-wrap items-center gap-2">
+                      <span>
+                        ⏸ {suspendedAccounts.map((a) => a.name).join('、')} 因连续失败被暂停 24h——测试成功或从提醒日志重发即可恢复。
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="rounded-full h-6 px-2 text-xs"
+                        onClick={() => suspendedAccounts.forEach((a) => resumeAccount(a))}
+                      >
+                        立即恢复全部
+                      </Button>
+                    </span>
+                  )}
+                </div>
+              </section>
+            )}
             {renderChannelStatsCard()}
             {renderDeliverabilityCard()}
             {[
@@ -971,6 +1138,23 @@ export default function Channels() {
         )}
       </main>
 
+      {/* v2.25: 渠道修复向导（暂停徽章的「🔧 修复」动作） */}
+      {repairAccountId !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-label="渠道修复向导">
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-y-auto overscroll-contain">
+            <ChannelRepairWizard
+              accountId={repairAccountId}
+              onClose={() => setRepairAccountId(null)}
+              onDone={() => {
+                setRepairAccountId(null);
+                void fetchData();
+                fetchStats();
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Template Selection Modal */}
       <Dialog open={showTemplateModal} onOpenChange={(open) => {
         // 点击遮罩层/旁边区域时直接关闭
@@ -1012,51 +1196,119 @@ export default function Channels() {
                 </TabsTrigger>
               </TabsList>
 
+              {/* v2.29：渠道搜索（61 个渠道按名称/描述/ID 实时过滤） */}
+              <div className="relative mb-4">
+                <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <Input
+                  value={templateSearch}
+                  onChange={(e) => setTemplateSearch(e.target.value)}
+                  placeholder="搜索渠道名称 / 描述 / ID…"
+                  className="pl-9"
+                  aria-label="搜索通知渠道"
+                />
+              </div>
+
+              {/* 分类筛选 chips：61 个渠道翻不动，先按类收敛 */}
+              <div className="flex flex-wrap gap-2 mb-4">
+                <button
+                  onClick={() => setCategoryFilter('all')}
+                  className={`text-xs px-3 py-1.5 rounded-full transition-colors min-h-11 flex items-center ${categoryFilter === 'all'
+                    ? 'bg-primary-500 text-white'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'}`}
+                >
+                  全部（{searchedTemplates.length}）
+                </button>
+                {Object.entries(CATEGORY_LABELS).map(([cat, label]) => {
+                  const count = searchedTemplates.filter((t) => (t.category ?? 'other') === cat).length;
+                  if (count === 0) return null;
+                  return (
+                    <button
+                      key={cat}
+                      onClick={() => setCategoryFilter(categoryFilter === cat ? 'all' : cat)}
+                      className={`text-xs px-3 py-1.5 rounded-full transition-colors min-h-11 flex items-center ${categoryFilter === cat
+                        ? 'bg-primary-500 text-white'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'}`}
+                    >
+                      {label}（{count}）
+                    </button>
+                  );
+                })}
+              </div>
+
               <AnimatePresence mode="wait">
                 <motion.div
-                  key={activeTab}
+                  key={activeTab + categoryFilter}
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
-                  className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-h-[50vh] overflow-y-auto pr-2"
+                  className="space-y-5 max-h-[50vh] overflow-y-auto overscroll-contain pr-2"
                 >
-                  {filteredTemplates.map((template) => {
-                    return (
-                      <button
-                        key={template.id}
-                        onClick={() => selectTemplate(template)}
-                        className="text-left p-4 rounded-2xl border border-slate-200 dark:border-slate-700 hover:border-primary-300 dark:hover:border-primary-700 hover:bg-primary-50/50 dark:hover:bg-primary-900/20 transition-all group min-h-11"
-                      >
-                        <div className="flex items-start gap-4">
-                          <div className="w-12 h-12 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 flex items-center justify-center group-hover:bg-primary-100 dark:group-hover:bg-primary-900/50 group-hover:text-primary-600 transition-colors">
-<ChannelIcon name={template?.icon} size={24} />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <h3 className="font-semibold text-slate-900 dark:text-white">
-                                {template.name}
-                              </h3>
-                            </div>
-                            <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 line-clamp-2">
-                              {template.description}
-                            </p>
-                            <div className="flex items-center gap-2 mt-3">
-                              <span className={`text-xs px-2 py-0.5 rounded-full ${getMethodColor(template.configMethod)}`}>
-                                {getMethodLabel(template.configMethod)}
-                              </span>
-                              {template.docsUrl && (
-                                <span className="text-xs text-primary-500 flex items-center gap-1">
-                                  <BookOpen size={10} />
-                                  文档
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <ChevronRight className="w-5 h-5 text-slate-400 group-hover:text-primary-500 transition-colors" />
-                        </div>
-                      </button>
-                    );
-                  })}
+                  {groupedTemplates.length === 0 && (
+                    <div className="text-center py-10 text-sm text-slate-500 dark:text-slate-400">
+                      {templateSearch || categoryFilter !== 'all' ? (
+                        <>
+                          没有匹配「{templateSearch || CATEGORY_LABELS[categoryFilter]}」的渠道
+                          <button
+                            type="button"
+                            onClick={() => { setTemplateSearch(''); setCategoryFilter('all'); }}
+                            className="ml-2 text-primary-500 hover:text-primary-600 underline underline-offset-2"
+                          >
+                            清除筛选
+                          </button>
+                        </>
+                      ) : (
+                        '该类型下暂无渠道'
+                      )}
+                    </div>
+                  )}
+                  {groupedTemplates.map((group) => (
+                    <div key={group.category}>
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">{group.label}</span>
+                        <span className="text-xs text-slate-400 dark:text-slate-500">{group.items.length}</span>
+                        <div className="flex-1 h-px bg-slate-200 dark:bg-slate-700" />
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        {group.items.map((template) => {
+                          return (
+                            <button
+                              key={template.id}
+                              onClick={() => selectTemplate(template)}
+                              className="text-left p-4 rounded-2xl border border-slate-200 dark:border-slate-700 hover:border-primary-300 dark:hover:border-primary-700 hover:bg-primary-50/50 dark:hover:bg-primary-900/20 transition-all group min-h-11"
+                            >
+                              <div className="flex items-start gap-4">
+                                <div className="w-12 h-12 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 flex items-center justify-center group-hover:bg-primary-100 dark:group-hover:bg-primary-900/50 group-hover:text-primary-600 transition-colors">
+                                  <ChannelIcon name={template?.icon} size={24} />
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <h3 className="font-semibold text-slate-900 dark:text-white">
+                                      {template.name}
+                                    </h3>
+                                  </div>
+                                  <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 line-clamp-2">
+                                    {template.description}
+                                  </p>
+                                  <div className="flex items-center gap-2 mt-3">
+                                    <span className={`text-xs px-2 py-0.5 rounded-full ${getMethodColor(template.configMethod)}`}>
+                                      {getMethodLabel(template.configMethod)}
+                                    </span>
+                                    {template.docsUrl && (
+                                      <span className="text-xs text-primary-500 flex items-center gap-1">
+                                        <BookOpen size={10} />
+                                        文档
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <ChevronRight className="w-5 h-5 text-slate-400 group-hover:text-primary-500 transition-colors" />
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
                 </motion.div>
               </AnimatePresence>
             </Tabs>
@@ -1093,9 +1345,73 @@ export default function Channels() {
                 </DialogTitle>
               </div>
             </div>
+            {/* v2.28：三步向导步骤指示 */}
+            <div className="flex items-center gap-2 mt-3 text-xs" aria-label="配置步骤">
+              {(['填写参数', '测试并保存'] as const).map((label, i) => {
+                const stepNo = (i + 1) as 1 | 2;
+                const active = wizardStep === stepNo;
+                const done = wizardStep > stepNo;
+                return (
+                  <span
+                    key={label}
+                    className={`px-2.5 py-1 rounded-full font-medium ${
+                      active
+                        ? 'bg-primary-500 text-white'
+                        : done
+                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                          : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                    }`}
+                  >
+                    {i + 1}. {label}{done ? ' ✓' : ''}
+                  </span>
+                );
+              })}
+            </div>
           </DialogHeader>
 
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain px-5 sm:px-6 py-4 space-y-4 scroll-smooth touch-pan-y">
+          {wizardStep === 2 ? (
+            /* ---------- v2.28 步骤②：测试并保存 ---------- */
+            <div className="space-y-4">
+              <div className="rounded-2xl border border-slate-200 dark:border-slate-700 p-4 space-y-2">
+                <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  {selectedTemplate?.name} · {configForm.name || '(未命名)'}
+                </p>
+                <ul className="text-xs text-slate-500 dark:text-slate-400 space-y-1">
+                  {(selectedTemplate?.fields ?? []).map((f) => {
+                    const v = (configForm[f.name] || '').trim();
+                    const secretConfigured = Boolean(selectedAccount?.secretConfigured);
+                    const tokenConfigured = Boolean(selectedAccount?.tokenConfigured);
+                    const configured = Boolean(selectedAccount) && (f.name === 'token' ? tokenConfigured : f.name === 'secret' ? secretConfigured : false);
+                    const shown = v
+                      ? (f.type === 'password' ? '••••••••（已填写）' : v)
+                      : configured ? '已配置，保持不变' : '（空）';
+                    return <li key={f.name}>{f.label}：{shown}</li>;
+                  })}
+                </ul>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" className="rounded-xl min-h-11" onClick={() => void testConfigDirect()} disabled={testingConfig}>
+                  {testingConfig ? (<><Loader2 size={16} className="mr-2 animate-spin" />测试中…</>) : '发送测试消息'}
+                </Button>
+              </div>
+              {directTestResult && (
+                <p className={`text-sm ${directTestResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500'}`} role="status">
+                  {directTestResult.ok ? '✓ ' : '✗ '}{directTestResult.message}
+                </p>
+              )}
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                测试成功后点击右下角「{selectedAccount ? '保存修改' : '添加渠道'}」完成绑定；测试失败请返回上一步核对参数。
+              </p>
+            </div>
+          ) : (
+            /* ---------- 步骤①：填写参数（原有内容 + 官方链接 + 必填校验提示） ---------- */
+            <div className="space-y-4">
+            {missingRequiredFields.length > 0 && (
+              <p className="text-xs text-amber-600 dark:text-amber-400" role="status">
+                还需填写：{missingRequiredFields.join('、')}
+              </p>
+            )}
             <div>
               <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
                 渠道名称 *
@@ -1154,7 +1470,7 @@ export default function Channels() {
                           <p>SMTP: {preset.servers.smtp}</p>
                           {preset.servers.pop3 && <p>POP3: {preset.servers.pop3}</p>}
                           {preset.servers.imap && <p>IMAP: {preset.servers.imap}</p>}
-                          {preset.servers.sslNote && <p className="font-sans text-slate-500 pt-1">{preset.servers.sslNote}</p>}
+                          {preset.servers.sslNote && <p className="font-sans text-slate-500 dark:text-slate-400 pt-1">{preset.servers.sslNote}</p>}
                         </div>
                       )}
                       {preset.cloudWarning && (
@@ -1243,6 +1559,28 @@ export default function Channels() {
             );
             })}
 
+            {/* v2.28：官方获取入口（docsUrl / officialUrl，元数据自带） */}
+            {(selectedTemplate?.officialUrl || selectedTemplate?.docsUrl) && (
+              <a
+                href={selectedTemplate?.officialUrl ?? selectedTemplate?.docsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-sm text-primary-500 hover:text-primary-600"
+              >
+                <BookOpen size={14} />
+                前往 {selectedTemplate?.name} 官方页面获取 Token / Webhook
+                <ExternalLink size={12} />
+              </a>
+            )}
+
+            {/* v2.29：官方页二维码 —— 凭据要在手机上取的渠道（扫码关注/注册），扫一下就行 */}
+            {(selectedTemplate?.officialUrl ?? selectedTemplate?.docsUrl) && (
+              <ChannelQr
+                url={selectedTemplate?.officialUrl ?? selectedTemplate?.docsUrl!}
+                name={selectedTemplate?.name}
+              />
+            )}
+
             {selectedTemplate?.id === 'smtp' && (
               <div className="space-y-3">
                 <Button
@@ -1293,6 +1631,8 @@ export default function Channels() {
                 <ExternalLink size={12} />
               </a>
             )}
+            </div>
+          )}
           </div>
 
           <div className="shrink-0 px-5 sm:px-6 py-4 border-t border-slate-200/80 dark:border-slate-700/80 bg-white/90 dark:bg-slate-900/90 backdrop-blur flex gap-3">
@@ -1311,6 +1651,17 @@ export default function Channels() {
             >
               取消
             </Button>
+            {wizardStep === 1 ? (
+              /* v2.28 步骤①主按钮：进入测试步骤（必填未齐时禁用） */
+              <Button
+                variant="vision"
+                className="flex-1 h-12 rounded-2xl font-bold shadow-lg shadow-primary-500/30"
+                onClick={() => { setDirectTestResult(null); setWizardStep(2); }}
+                disabled={missingRequiredFields.length > 0 || !(configForm.name || '').trim()}
+              >
+                下一步：测试连接
+              </Button>
+            ) : (
             <Button
               variant="vision"
               className="flex-1 h-12 rounded-2xl font-bold shadow-lg shadow-primary-500/30"
@@ -1326,6 +1677,7 @@ export default function Channels() {
                 selectedAccount ? '保存修改' : '添加渠道'
               )}
             </Button>
+            )}
           </div>
         </DialogContent>
       </Dialog>

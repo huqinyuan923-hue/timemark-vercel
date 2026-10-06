@@ -14,18 +14,29 @@ events.use('*', authMiddleware);
 
 events.get('/', async (c) => {
   const user = c.get('user');
-  
-  // 解析分页参数
-  const page = parseInt(c.req.query('page') || '1', 10);
-  const limit = parseInt(c.req.query('limit') || '50', 10);
+
+  // 解析分页参数（v2.27：limit 封顶 200，page 下限 1，防止一次拉全表）
+  const page = Math.max(1, parseInt(c.req.query('page') || '1', 10) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(c.req.query('limit') || '50', 10) || 50));
   const offset = (page - 1) * limit;
 
   // 可选档案过滤（checkbox 69）：省略 = 全部档案；他人的档案一律 404。
   const profileFilter = await parseProfileFilter(c, Number(user.id));
   if (profileFilter instanceof Response) return profileFilter;
-  
+
+  // v2.27：type 筛选 / upcoming 过滤 / 排序键——全部白名单后透传给服务层。
+  const typeRaw = c.req.query('type') || '';
+  const type = ['birthday', 'anniversary', 'exam', 'holiday', 'other'].includes(typeRaw) ? typeRaw : null;
+  const upcoming = c.req.query('upcoming') === '1' || c.req.query('upcoming') === 'true';
+  const sort = c.req.query('sort') === 'created_at' ? 'created_at' as const : 'date' as const;
+
   // 获取分页数据
-  const result = await getEventsByUserIdPaginated(user.id, limit, offset, profileFilter);
+  // v2.27：tag 子串筛选（trgm GIN 索引使 ILIKE 高效）；非法长输入拒绝
+  const tagRaw = (c.req.query('tag') || '').trim();
+  if (tagRaw.length > 50) {
+    return c.json({ success: false, error: 'tag 过滤值过长' }, 400);
+  }
+  const result = await getEventsByUserIdPaginated(user.id, limit, offset, profileFilter, { type, upcoming, sort, tag: tagRaw || null });
   
   return c.json({
     success: true,
@@ -41,7 +52,10 @@ events.get('/', async (c) => {
 
 events.post('/', async (c) => {
   const user = c.get('user');
-  const body = await c.req.json();
+  const body = await c.req.json().catch(() => null);
+  if (body === null) {
+    return c.json({ success: false, error: '请求体必须是 JSON' }, 400);
+  }
   const parsed = createEventSchema.safeParse(body);
 
   if (!parsed.success) {
@@ -93,7 +107,12 @@ events.post('/', async (c) => {
 events.get('/reminder-logs', async (c) => {
   const user = c.get('user');
   const userId = Number(user.id);
-  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 200);
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10) || 50, 200);
+  const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
+  // v2.27 F40：服务级筛选（status 白名单）——此前只有前端展示层
+  const statusRaw = c.req.query('status') || '';
+  const status = ['success', 'failed', 'skipped'].includes(statusRaw) ? statusRaw : null;
+  const format = c.req.query('format');
 
   // Display contract: trigger_date is TEXT since migration 51 and holds two families of ids.
   // A row's first 10 chars are a calendar day `YYYY-MM-DD` ONLY for legacy rows (exactly
@@ -107,15 +126,37 @@ events.get('/reminder-logs', async (c) => {
     `SELECT tl.id, tl.event_id, tl.trigger_type,
             CASE WHEN tl.trigger_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN LEFT(tl.trigger_date, 10) ELSE tl.trigger_date END AS trigger_date,
             tl.status,
-            tl.error_message, tl.channel_results, tl.created_at,
+            tl.error_message, tl.channel_results, to_char(tl.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
             e.name AS event_name, e.type AS event_type
      FROM event_trigger_logs tl
      LEFT JOIN events e ON e.id = tl.event_id
      WHERE tl.user_id = $1
-     ORDER BY tl.created_at DESC
-     LIMIT $2`,
-    [userId, limit],
+       AND ($2::text IS NULL OR tl.status = $2::text)
+     ORDER BY tl.created_at DESC, tl.id DESC
+     LIMIT $3 OFFSET $4`,
+    [userId, status, limit, offset],
   );
+
+  // v2.27 E-9：?format=csv —— 事件维度提醒历史一键导出（与 /trigger-logs/export.csv 同款响应）
+  if (format === 'csv') {
+    const header = 'event_name,event_type,trigger_type,trigger_date,status,error_message,created_at';
+    const esc = (v: unknown) => {
+      const str = v == null ? '' : String(v);
+      return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+    };
+    const lines = result.rows.map((row: Record<string, unknown>) =>
+      [row.event_name, row.event_type, row.trigger_type, row.trigger_date, row.status, row.error_message, row.created_at]
+        .map(esc)
+        .join(','),
+    );
+    const csv = `\uFEFF${[header, ...lines].join('\n')}`;
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="reminder-logs-${new Date().toISOString().slice(0, 10)}.csv"`,
+      },
+    });
+  }
 
   return c.json({ success: true, data: result.rows });
 });
@@ -185,14 +226,23 @@ events.post('/:id/test-send', async (c) => {
   const { recordEventTrigger } = await import('../services/trigger-log.service.js');
   const { query } = await import('../db/index.js');
   
-  const result = await query('SELECT * FROM events WHERE id = $1 AND user_id = $2', [id, user.id]);
+  // v2.27：列清单代替 SELECT *（只为读通知字段，省大 JSONB 列传输）
+  // v2.27：列清单须覆盖 sendNotifications 渲染所需（农历标签/双历/自定义提醒时间）
+  const result = await query('SELECT id, name, type, date, person_name, calendar_type, lunar_date, reminder_time, reminder_config, notification_channels, notification_account_ids, profile_id FROM events WHERE id = $1 AND user_id = $2', [id, user.id]);
   if (result.rows.length === 0) {
     return c.json({ success: false, error: 'Event not found' }, 404);
   }
   
   const event = result.rows[0];
   const rawChannels = event.notification_channels;
-  const baseChannels = typeof rawChannels === 'string' ? JSON.parse(rawChannels) : (rawChannels || []);
+  // v2.27：损坏的渠道 JSON 不再让 test-send 500（与定时路径 parseJsonField 同守卫）
+  let baseChannels: string[] = [];
+  try {
+    const parsed = typeof rawChannels === 'string' ? JSON.parse(rawChannels) : (rawChannels || []);
+    baseChannels = Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    baseChannels = [];
+  }
   const today = new Date().toISOString().slice(0, 10);
 
   // checkbox 167：手动测试发送必须和定时路径使用同一套渠道解析
@@ -323,7 +373,10 @@ events.post('/:id/snooze', async (c) => {
 events.put('/:id', async (c) => {
   const user = c.get('user');
   const id = c.req.param('id');
-  const body = await c.req.json();
+  const body = await c.req.json().catch(() => null);
+  if (body === null) {
+    return c.json({ success: false, error: '请求体必须是 JSON' }, 400);
+  }
   const parsed = updateEventSchema.safeParse(body);
 
   if (!parsed.success) {
@@ -354,8 +407,8 @@ events.put('/:id', async (c) => {
     }
   }
 
-  const success = await updateEvent(id, user.id, parsed.data);
-  if (!success) {
+  const updated = await updateEvent(id, user.id, parsed.data);
+  if (!updated) {
     return c.json({ success: false, error: 'Event not found' }, 404);
   }
   const { refreshUserEventCache } = await import('../services/event-cache.service.js');
@@ -363,16 +416,33 @@ events.put('/:id', async (c) => {
   logFireAndForget('events.cache_refresh_failed', 'Failed to refresh user event cache'),
 );
 
-  // 事件更新后立即检查是否需要发送提醒
-  // 这样可以确保不会错过即将到来的提醒时间
-  try {
-    const { sendReminders } = await import('../jobs/tasks.js');
-    await sendReminders();
-  } catch (error) {
-    console.error('[PUT /events/:id] Failed to check reminders after event update:', error);
-  }
+  // v2.27：提醒检查改为 fire-and-forget —— PUT 不再被全量提醒扫描阻塞
+  // （POST 路径 :77 附近已是同款模式，这里对齐）。
+  void (async () => {
+    try {
+      const { sendReminders } = await import('../jobs/tasks.js');
+      await sendReminders();
+    } catch (error) {
+      console.error('[PUT /events/:id] Failed to check reminders after event update:', error);
+    }
+  })();
 
   return c.json({ success: true });
+});
+
+// v2.27 A-2：事件单条读取端点（此前只有列表；供深链/编辑前刷新使用）
+events.get('/:id', async (c) => {
+  const user = c.get('user');
+  const id = c.req.param('id');
+  if (!/^\d+$/.test(id)) {
+    return c.json({ success: false, error: '无效的事件 ID' }, 400);
+  }
+  const result = await query('SELECT * FROM events WHERE id = $1 AND user_id = $2', [id, user.id]);
+  if (result.rows.length === 0) {
+    return c.json({ success: false, error: 'Event not found' }, 404);
+  }
+  const { mapEventRow } = await import('../services/event.service.js');
+  return c.json({ success: true, data: mapEventRow(result.rows[0]) });
 });
 
 events.delete('/batch', async (c) => {

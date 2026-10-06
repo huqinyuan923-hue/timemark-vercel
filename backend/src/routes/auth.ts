@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import { verifyUserForLogin, getUserByUsername, createLoginLog, trackLoginFailure, getAccountLockStatus, clearAccountLock, getIpBlockStatus, evaluateIpBlock, checkIpWhitelistFromUser, verifyTotpCode, verifyUserPassword } from '../services/auth.service.js';
 import { getClientIp, getClientIpInfo } from '../utils/client-ip.js';
-import { getTurnstileSiteKey, isTurnstileEnabled, verifyTurnstileToken } from '../utils/turnstile.js';
+import { verifyTurnstileToken, turnstileConfigPayload } from '../utils/turnstile.js';
 import { isSafePublicUrl } from '../utils/url-safety.js';
 import { lookupGeoLabel } from '../utils/geoip.js';
 import { logSecurityEvent } from '../services/security-event.service.js';
@@ -192,6 +192,30 @@ auth.post('/login', loginRateLimit, async (c) => {
         eventType: 'login_success',
         ip,
         userAgent,
+      }),
+      // v2.30：新设备登录提醒（fire-and-forget，不阻塞登录响应）。
+      // alertType 一直存在但从未接线——死代码转活；首登（无历史指纹）也提醒。
+      (async () => {
+        if (!deviceFingerprint) return;
+        const known = await query(
+          `SELECT 1 FROM login_logs
+           WHERE user_id = $1 AND success = TRUE AND device_fingerprint = $2
+           LIMIT 1`,
+          [numericUserId, deviceFingerprint],
+        );
+        if (known.rows.length > 0) return;
+        await sendSecurityAlert({
+          userId: numericUserId,
+          adminEmails: [],
+          username: user.username,
+          ip,
+          userAgent,
+          failureCount: 0,
+          locked: false,
+          alertType: 'new_device',
+        });
+      })().catch((err) => {
+        logFireAndForget('auth.new_device_alert_failed', 'New-device alert failed')(err);
       }),
     ]).catch(
       logFireAndForget('auth.login_post_success_failed', 'Login post-success side effects failed'),
@@ -419,13 +443,7 @@ function toIsoLoginTime(value: unknown): string | null {
 }
 
 auth.get('/turnstile-config', async (c) => {
-  return c.json({
-    success: true,
-    data: {
-      siteKey: getTurnstileSiteKey() || null,
-      enabled: isTurnstileEnabled(),
-    },
-  });
+  return c.json({ success: true, data: turnstileConfigPayload() });
 });
 
 auth.get('/login-history', authMiddleware, async (c) => {

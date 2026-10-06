@@ -1,5 +1,199 @@
 # Changelog
 
+## v2.30.0 (2026-10-06) — 生产救活 + AI 日报/周报 + 对外 API 门户 + 全链路真发真收
+
+### 生产救活（恶性 bug）
+- 修复 v2.28 起**整个后端在生产不可用**的冷启动崩溃：`createRequire(import.meta.url)` 在 esbuild CJS bundle 中 `import.meta` 为空，模块求值即抛错，全部 `/api/*` 返回 Vercel 裸 500（登录页 Turnstile 消失只是症状，环境变量一直正常）
+- 构建期冷启动冒烟门禁：bundle 生成后立即 `require()` 验证，此类回归永远进不了生产
+- Turnstile 加固：`misconfigured` 配置不对称显式暴露、前端告警横幅（消灭静默 `.catch(() => {})`）、health/Security/DeployWizard 三维体检
+
+### 全链路真发真收（FULLCHAIN harness，8/8 绿）
+- 新增 `e2e/fullchain.spec.ts`：登录 → 绑渠道 → 建事件 → webhook/SMTP 真发真收 → 触发日志 → 收件箱 → Cron 监控 → **自动路由验证**（不绑渠道不填邮箱的事件经"全部启用账户"兜底真实投递）
+- harness 首跑即抓出并修复 6 个 mock 测不出的生产 bug：
+  - pg-rate-limit SQL 参数错位（42P18）→ 限流静默失效（fail-open）+ 时区 8h 偏移
+  - 收件箱收件 token 只在历史迁移生成过一次（新装用户永远没有收件地址）
+  - 收件箱签名密钥从未展示（验签强制但无人可用）
+  - cron 间隔告警写 broadcast 源（收件箱永不可见的死信）
+  - SMTP 强制 STARTTLS 硬编码（内网无 TLS relay 不可用，新增 `SMTP_REQUIRE_TLS` 开关）
+  - 渠道发送链一次 fromPromise unhandledRejection 击穿进程（shadow catch + 进程级兜底）
+
+### 方向 A：AI 日报/周报自动化
+- 日/周粒度摘要（24h 快照 / 7 天对比），复用月/年引擎（AI 叙述 + PDF + 收件箱归档）
+- 设置页独立排程（开关 + 时刻/星期），本地时区到点判断 + digest_archive 同期号查重
+- `GET /api/cron/digest?period=daily|weekly` + 迁移 v81
+
+### 方向 B：对外 REST API + Token 门户
+- `/api/v1/*` 六端点（事件/到期/习惯/日统计 + 新建事件），与 MCP 共用 tmt_ Token：逐调用鉴权、scope 门槛、120/min 限流、逐调用审计
+- API 门户页：Token 创建/回收/调用流水 + 端点文档（系统组新导航入口）
+
+### 收件箱 / Cron 监控 / 渠道 / 其他
+- 收件箱：来源标签页（广播不再死信）、批量已读/删除、收件地址二维码、保留期展示、未读跨源统计
+- Cron 监控：任务健康分 + 迷你运行历史 + 「立即运行」（白名单幂等任务）+ 总体健康徽标
+- 渠道：健康总览五色计数 + 暂停账户一键恢复
+- 安全：新设备登录提醒接线（原 alertType 死代码）+ 模板 🆕 分支
+- 导航：收件箱未读徽标（底栏/抽屉/标签页标题）
+- Broadcast：发送确认闸门 + 服务端渲染预览接线
+- Habits：一键打卡未达标
+- AI 对话：修复"截断/滑不动"（dvh 自适应高度 + 移除 overscroll-contain + 流式滚底）+ 清空按钮显性化
+
+### 质量基线
+- 后端 1724 测试 / 前端 316 测试全绿，双端 tsc 干净
+- 逐项账本：docs/v2.30-LEDGER.md（F 54 项功能 / O 14 项优化，如实计数）
+
+## v2.29.0 (2026-10-06) — 渠道 61 + 分类/二维码 + 全站 UI 统一 + AI 追问上下文
+
+### 通知渠道：51 → 61（分类 + 扫码绑定）
+
+- **wave4 新增 10 渠道**（纯 HTTP、零新依赖、全带专属连接测试）：Guilded、IFTTT、Revolt、OneSignal、SendGrid、Mailgun、Vonage SMS、MessageBird、Alertzy、Awtrix 3（像素时钟）。
+- **渠道分类体系**：即时通讯 / 推送通知 / 邮件 / 短信 / 智能家居 / 自动化六类注入全部 61 渠道；模板选择器分组展示 + 分类筛选 chips + 实时搜索（名称/描述/ID）+ 空结果态；账户卡标注分类徽标。
+- **二维码扫码绑定**：官方集成页转二维码（纯前端生成，链接不出本机），凭据要在手机上取的渠道（WxPusher/Server酱/IFTTT Key…）扫码直达。
+- **测试连接延迟回传**：/channels/test 返回 latency，向导成功提示附耗时（wave4 全部 test 函数覆盖）。
+- 审查修复：Vonage/Alertzy/OneSignal「HTTP 200 + 错误响应体」不再被当成功（此前短信/推送静默丢失）；Vonage 测试改 GET get-balance（原 POST form 恒 400）；envChecks 加信任级门控。
+- 文档：CHANNEL_MATRIX 61 渠道重生成；README/CHANNEL_COMPATIBILITY 计数同步；README 渠道表补 v2.28 漏掉的 5 行。
+
+### 全站 UI 统一重设计（流光背景保留，只统一组件层）
+
+- **PageHeader 组件收口 22 页**手写 sticky header（三种变体 + Security/CronMonitor/Contacts/AnnualReport 四个离群样式全消），返回逻辑三套（navigate(-1)/useSmartBack/硬编码）统一为 props。
+- **EmptyState** 统一 21 处空态（4 种写法归一）；**SkeletonCard** 统一 7 处骨架屏；**delivery-outcome-ui** 共享映射收口 3 处重复的投递结果样式表。
+- CronMonitor 同页双展示去重；删除无引用的 ExportPanel + print-export.css；ChannelIcon 图标映射 23→33（修 Radio/Bot/BellRing 等静默回退）。
+- 视觉验收代理 3/3 pass（药丸 header 统一、无截断错位）。
+
+### AI 全链路
+
+- **多轮追问上下文**：RAG 注入最近 3 轮问答（答案截断防上下文爆炸），"它呢/第二个是什么"可答；有效检索回答（retrieval-only）也参与。
+- **输出禁令**：SYSTEM_PROMPT 明令自然中文短句、禁止 Markdown 记号、只答最后一问。
+- 前端审查修复：搜索防整卡重挂载、priorHistory 过滤放宽、空态兜底文案。
+
+### 运维
+
+- **环境变量体检**：deploy-info envChecks 扩 9 项可选功能（Telegram Bot / Web Push / Google OAuth / Blob / 语义搜索 / WebAuthn / APP_BASE_URL / DEPLOY_TOKEN / HEALTH_DETAIL_TOKEN），只报布尔绝不回显值；Security 页三态网格（✓/○/✗，必填缺失红 ✗）。
+- **日志防撑爆**：保留期第三轮 12 张表接入（interactions/maintenance_logs/ocr_results/agent_feedback/agent_decision_cards/agent_routine_artifacts/agent_digest_folds/agent_notification_claims/agent_confirmations/agent_workers/bot_link_codes/webauthn_challenges），清理注册表 23→35。
+
+### 自查与实测
+
+- 双端审查代理 12 项发现（2 P1 / 2 P2 / 8 P3）全部修复；后端审查同时确认三集合同步、凭据列映射、12 张表列名、SQL 零拼接、无值泄漏。
+- Playwright 实测：分类 chips/搜索/Awtrix 二维码/环境变量卡/LocalAI 首卡；wave4-dispatch 新增 3 个「200 带错误体必须抛错」反向测试。
+- 后端 1678 / 前端 310 测试全绿；tsc 双端零错误；账本 docs/v2.29-LEDGER.md 逐项可核对（20 功能 / 100 优化）。
+
+## v2.28.0 (2026-10-06) — AI 对话体验 + 渠道向导(51 渠道) + 日志治理
+
+### AI 对话（用户反馈的三大痛点全部修复，根因均为实查定位）
+
+- **「看不到后续对话」**：真因是对话卡排页面第 3、移动端被顶出视口 + overscroll-contain 吞手势——对话卡提升为首卡，模型/知识库设置折叠为次级 details；双层滚动（容器内滚底 + 卡片出视口时受控 window.scrollTo）。
+- **「不能停止」**：三个缺口全补——模型首次加载可中止（getEngine 监听 abort 即刻拒绝）；祝福草稿/礼物建议补停止按钮（abortRef 存在但无 UI）；Dock 助手工具调用可中止（AbortController + 运行态停止键）。
+- **「输出 markdown 而非自然汉字」**：RAG 提示词明令禁止 markdown + 渲染层 stripMarkdownLight 清洗（去 #/**/-/` 等标记，保留换行与来源编号）。
+- **AI 权限**：update_event/snooze_reminder/create_expiry/create_document/log_interaction 五个敏感写操作加入确认闸（registry hash 同步）；意图路由扩至 该联系谁/习惯/行为规律/关键词搜索。
+
+### 通知渠道：46 → 51
+
+- **三步绑定向导**：选渠道 → 填写（逐字段帮助 + 「去官方获取 Token」直达链接 + 必填即时校验）→ 测试并保存（**保存前真实直测** + 脱敏摘要 + 结果横幅）。
+- **新增 5 渠道**（纯 HTTP、零新依赖、全带专属连接测试）：PushBullet、Join、PushSafer、Webex、Notifiarr。
+- 文档全量重生成：CHANNEL_MATRIX（51 渠道 × 字段→列映射 × 测试路径）、README/CHANNEL_COMPATIBILITY/FREE_TIER_DEPLOY/INTEGRATIONS 锚点同步（schema v80）。
+
+### 日志治理
+
+- cron 失败原因不再 '[redacted]'（会话用户全显 / API key 需 admin scope）；CronMonitor 补渲染各任务最新状态与耗时。
+- 请求完成日志（status+耗时）+ 移除双轨日志；DB 查询失败无条件记录 + 慢查询 >500ms 阈值。
+- 5 张零清理表补保留期（scheduler_runs/rate_limits/collaboration_activity/data_health_repairs/calendar_sync_events，清理注册表 18→23）。
+- 邮件日志卡显示失败原因、'received' 状态修正、文案对齐；提醒日志渠道下拉/重试错误详情/分页；/api/health 版本号从 package.json 注入。
+
+### 自查与实测
+
+- 审查代理 7 项真实 bug 全修（确认流判定错层、搜索意图路由、向导编辑锁死、cron 脱敏信任级、向导状态残留、完成日志 500 记 200、双引擎并发加载）。
+- Playwright 真浏览器实测：AI 新布局/会话持久化、渠道向导全流程（真实调用 PushBullet API 验证 401 回显）、全部通过。
+- 后端 1665 / 前端 308 测试全绿；账本 docs/v2.28-LEDGER.md 逐项可核对。
+
+## v2.26.0 (2026-10-05) — 祝福链修复 + 日志保留 + UI 合并 + 全站动画
+
+### 批次 A：祝福链修复（v80 前置）
+
+- **邮件送达性头**：sendRawEmail 双栈（Resend + SMTP）统一附加 Reply-To / List-Unsubscribe（mailto: + https 双写）/ List-Unsubscribe-Post / Message-ID——对齐 Gmail/Yahoo 批量发件人新规，降低被拦截概率。
+- **预演所见即所发**：`/greetings/preview` 改走 `composeFinalGreeting` 单入口（此前预演用组合引擎、真发可能走 AI，两者可能不一致）；历史记录带 source（AI 生成/组合引擎）徽章。
+- **AI 预算闸**：日上限 20 条（超限回落组合引擎，调用方无感）；每 cron tick 上限 5 条 AI 生成。
+- **语气选项**：AI 祝福支持语气要求；设置页单条「AI 预览」按钮（POST /greetings/preview-ai）。
+
+### 批次 B：日志保留与 AI 归档（迁移 v80）
+
+- **18 张日志表全部有界**：此前从未清理过的 13 张表（reminder_send_claims、scheduler_ticks、audit_events、audit_undo_snapshots、security_events、audit_logs、bot_updates、bot_audit_logs、webhook_idempotency_keys、feed_ingest_seen/proposals、greeting_history、cron_execution_logs）补上保留期（30–1095 天按表分级）；runner 单表失败不拖垮整体。
+- **cron 日志有界化**：成功路径改 `cron_job_status` upsert（每 job 恒一行，含 last_summary/duration），替代此前每分钟一条的无限增长；失败才写 `cron_execution_logs` 明细（30 天清理）。`/api/health` 与 `/api/cron-monitor` 改读有界表。
+- **AI 月报归档**：digest 发送前正文（AI 叙述或确定性统计）写入 `digest_archive` 永久保存——原始触发日志 90 天后清掉，AI 提炼的"重要的东西"留下来。
+- **慢查询治理**：event_trigger_logs / cron_execution_logs 加窗口与索引（idx_cron_executed_at、idx_trigger_user_created）；patterns 服务查询加 90 天窗口。
+- **设置页数据管理卡**：保留策略展示 + 「立即清理」（与 nightly 同一代码路径）+ AI 月报归档列表（GET/POST /api/retention）。
+
+### 批次 C：UI 合并（功能重合去重）
+
+- **删除 /assistant 页**：AssistantDock 已全局承载同一面板，独立页是第二个入口——删页，dock 成唯一入口。
+- **/reminders 并入 /trigger-logs**：两页展示的是同一类数据（事件提醒投递历史）且共用 readDelivery 判定——Reminders 列表抽取为 `EventReminderLogs` 组件成为「事件提醒」tab（`?tab=reminders` 可深链），旧链接 301 重定向；底部栏主位直接指向合并页。
+- **联系人快捷发信 → Broadcast 深链**：快捷发信弹窗与「批量邮件」功能重合——按钮改深链 `/broadcast?contact=<id>`，Broadcast 预选该联系人并消费 query；两套写信 UI 归一。
+- **命名修正**：导航「通知模板」→「事件模板」（页面本就自称事件模板）；「问答」→「智能问答」。
+- **导航不变式更新**：nav-groups 测试新增 REDIRECT_ROUTES 集合（重定向兜底路由不需要入口）。
+
+### 批次 D：全站动画与滚动治理
+
+- **页面过渡真正生效**：Routes 包 AnimatePresence(mode='wait') + keyed motion 包装——此前各页根元素写好的 exit= 全是死代码（Routes 没有 AnimatePresence 退出动画从不执行）；路由层统一过渡一次覆盖 28+ 页；/login 与 embed/share 跳过；AppRoutes 显式固定 location，退场树不会跳变到新路由内容。
+- **弹层补动画**：AssistantDock 面板、CommandPalette、MobileBottomNav「更多」抽屉此前都是无动画条件渲染——补出场/退场 motion（抽屉 spring 上滑、面板 fade+scale）。
+- **滚动穿透治理**：全站 17 处内部滚动容器（弹窗、抽屉、面板、列表）补 `overscroll-contain`——弹层内滚到底不再拖动整页。
+- **LocalAI 对话滚动修复**：`scrollIntoView` 会滚动所有可滚祖先（整页）导致发消息后页面跳走——改为只滚对话容器自身 `container.scrollTop`。
+- **PWA 安装浮层「稍后」记忆**：dismiss 后 7 天内不再弹（此前每次加载都弹）。
+
+### 批次 E/F：AI 增强
+
+- **周报 AI 综述（首个真实 AI 消费者）**：确定性周报之上加 2-3 句 AI 综述——每周每用户至多 1 次、maxTokens 220、lite tier，AiDisabledError/失败/空清单退回与纯确定性渲染逐字节一致的原文；usage tokens 计入 costTokens；narrate 可注入（回归测试 3 例）。
+- **本地 AI 会话持久化**：对话历史存 IndexedDB（快照式、上限 100 条、来源徽章一并恢复），刷新/重进不丢；「清空对话」按钮。
+- **快捷指令**：LocalAI 空态提供 4 个常用问法一键填入。
+- **礼物建议**：祝福草稿工具新增「礼物建议」——本地 WebGPU 按关系/备注生成 3-4 个带价位建议（数据不出本机）。
+- **生日前 3 天准备提醒**：生日事件默认注入 d3 提醒（用户已配置 d3 则不重复注入）。
+- **docs/AI.md**：Vercel GPU 专项调研结论（运行时不占构建分钟核实无误 / GPU 仅 beta+Pro / CPU 生成式推理实测不可用）+ AI 消费者与预算总表。
+
+### 验证记录
+
+- 后端 1664 / 前端 308 测试全绿；双端 tsc 干净；vite build 通过
+- v80 干净库迁移验证（docker postgres:16-alpine）：schema_version=80，cron_job_status（含 last_summary）/ digest_archive / greeting_history.source,tone / 新索引全部就位
+- Playwright 真浏览器实测：登录 → /reminders 重定向与 tab → /assistant 删除+dock 全局 → 设置页数据管理卡（真调 purge-now）→ Broadcast ?contact= 深链预选 → 联系人快捷发信深链 → LocalAI 快捷指令 + WebGPU 本地问答端到端 + 会话持久化（刷新恢复）→ 命令面板开合，全程无 console error
+- Mimosa 深度扫描后台执行（git-gate advisory 提示的完整审计补课）
+
+## v2.25.0 (2026-10-05) — 无审查本地模型 + AI 定时生日祝福
+
+### 新增（功能 30 项，编号后括注验证方式）
+
+**本地模型多档化（批次 A）**
+- **三档模型选择器**：轻快档 0.5B（278MB，内置直发秒开）｜强力中文档 Qwen3-1.7B（944MB，在线获取）｜无审查档 Hermes-3-Llama-3.2-3B（1.7GB，Nous Research 微调，在线获取）。UI 选档 + localStorage 记忆（单测 16 例 + vite build + 真浏览器）。
+- **在线获取档**：两档最大分片 155/197MB 超 GitHub 单文件 100MB 硬限（实测），改为不入库不进构建产物——UI 一键下载 → hf-mirror 流式拉取 → IndexedDB 永久缓存后离线；wasm kernel（~5MB）入库同源托管（raw.githubusercontent 国内不可达）。
+- **契约全部实测**：sha256 来自 HF tree API lfs.oid / 知屋 contracts，零手写值。
+- 切档自动卸载旧引擎释放显存（WebGPU）。
+
+**AI 定时生日祝福（批次 B，迁移 v79）**
+- **祝福组合引擎**（`shared/greeting-composer.ts`）：开头×主体×结尾×关系维度组合，按 contactId+year 确定性轮换——同人每年不重文、预演所见即所发、纯函数零依赖（单测 7 例）。
+- **AI 双路生成**：配了 AI 网关时按联系人上下文（称呼/关系/性别/备注）生成个性化祝福（lite tier + sanitize-html 清洗），未配/失败自动回落组合引擎——祝福永远发得出去。
+- **自动/草稿双模式**：自动=当天 cron 生成并直发；草稿=进待确认列表一键发送（设置页开关）。
+- **生日祝福设置卡**：模式/AI 开关 + 未来 30 天预演（每人日期+主题+退订标记）+ 草稿发送/丢弃 + 今年已发计数。
+- **greeting_history 表**：谁/哪年/渠道/最终文案——轮换依据 + 审计 + 草稿暂存。
+- **联系人生日字段**（fixed_contacts.birth_date）：没建生日事件的联系人也能触发祝福；联系人表单加生日与「退出祝福」开关。
+- **/api/greetings 路由**：settings/preview/history/send-draft/discard-draft/channels-check（路由测试 9 例）。
+- **本地 AI 写祝福工具**：/local-ai 页选联系人→本地 WebGPU 生成→复制（数据不出本机）。
+- **防拦截组合拳**：每人每年内容唯一 + 发信白名单（仅联系人，复用 sendContactEmail）+ 送达性头链路 + 无外链图片 + 联系人级退订 + 每年幂等（claim + history 双闸）。
+
+**其他新功能（批次 C）**
+- **静默时段横幅**：Dashboard 在静默窗口内显示"提醒会窗口结束后补发，不会丢失"（支持跨午夜窗口）。
+- **渠道修复向导接入**：暂停徽章旁新增「🔧 修复」——诊断→换凭据→重新启用的完整向导（组件已存在但从未挂载，现已接线）。
+- **blessings 扩池**：birthday 14→24 条、anniversary 7→12 条，加现代语气变体。
+- **祝福语确定性轮换**：getBlessing 从 Math.random 改为按 (类型+人+当天) 哈希——同天同人不重复、跨天轮换、可复现。
+- **命令面板快捷入口**：空态新增 本地 AI / 通知渠道 / 提醒日志 直达按钮。
+- **渠道统计导出 CSV**：按渠道+按账户两段，带 BOM（Excel 中文不乱码）。
+- **提醒日志渠道徽章图标**：✓ email 前显示该渠道真实图标。
+
+### 优化（30 项，已落地 22 项）
+
+1. WebLLM 引擎单例 → Map<tier>（知屋模式）；2. RAG 提示词/生成参数按档位化（0.5B 硬约束防跑飞，大模型放宽）；3. 切档释放旧引擎显存；4. LocalAI 模型文案去硬编码；5. 内置权重就绪探测只测 bundled 档（remote 档不做无意义 HEAD）；6. AI 输出 sanitize-html 强制接入；7. AI 祝福走 lite tier（低成本槽）；8. 祝福幂等双闸（claim + history）；9. 预演用 composer 确定性输出（不真调 AI，省时省钱）；10. greeting 发送失败释放 claim 供重试；11. TriggerLogs 图标缓存单飞；12. Contacts 表单状态新增 birthDate/greetingOptOut 直通 payload；13. 命令面板空态可操作化；14. 静默窗口解析容错（畸形值不渲染）；15. 统计 CSV 转义/转 BOM；16. 迁移链测试尾 pin 全量更新至 v79（migration-versions 重新生成）；17. 迁移链注释同步（74→75 注册数）；18. selfcheck ahead 测试用例前移一位（80）；19. vitest mock 补齐 templates 分支（TriggerLogs）；20. 渠道页统计卡与 fetchStats 联动修复向导完成后的刷新；21. shared 重建后类型即时对齐（birthDate/greetingOptOut 推导）；22. eslint/tsc 全绿贯穿。
+
+**未完成（如实记录，建议下轮）**：祝福投递的非邮件渠道（联系人 telegram/qmsg/wxpusher 字段已有但投递未接）、通知规则时间线、本地 AI 会话历史持久化、Web Push 设备管理页、联系人生日 CSV 批量导入、数据健康"生日联系人缺邮箱"检查项、年度报告祝福回顾、greeting cron 分批预算。
+
+### 验证记录
+
+- 后端 1661 / 前端 308 测试全绿；双端 tsc 干净；vite build 通过
+- v79 干净库迁移验证：schema_version=79，4 个新列 + greeting_history 表就位
+- Hermes-3/Qwen3-1.7B 契约来自 hf-mirror tree API 实测（65/37 文件，sha256 全对齐）
+
 ## v2.24.1 (2026-10-05) — 本地 AI 实机验证修复
 
 ### 修复

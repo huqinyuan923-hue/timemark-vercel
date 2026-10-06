@@ -1738,6 +1738,12 @@ export async function sendReminders() {
     // 包含 0 表示当天也提醒
     const allDays = daysBeforeList.includes(0) ? daysBeforeList : [0, ...daysBeforeList];
 
+    // v2.26 F：生日默认加「3 天后」一条准备提醒（提醒正文自然带"3 天后"字样）。
+    // 用户已配置 d3 时不重复注入；其它事件类型不注入。
+    if (event.type === 'birthday' && !allDays.includes(3)) {
+      allDays.push(3);
+    }
+
     // checkbox 78：节假日感知调度。`keep`（默认）保留原定日并在正文附节假日名；
     // `suppress` 在法定假日抑制；`shift` 顺延到节后第一个工作日。FAIL-OPEN：日历
     // 未覆盖（如 2031）时 resolveHolidayEvalDays 返回 [today]，提醒绝不丢失。
@@ -1995,12 +2001,17 @@ export async function sendReminders() {
 
   // checkbox 168：生日祝福投递。与机主提醒的发送结果完全无关（机主提醒不依赖联系人渠道，
   // 祝福也不依赖机主提醒是否成功）；每个联系人每年至多一条，claim 去重（重复 tick 只打 debug）。
+  // v2.26 分批：每个 tick 最多 5 条走 AI 生成（AI 调用串行且慢，防止 50 人同天把函数拖过
+  // maxDuration）；超出的让给组合引擎兜底（祝福仍会发出），次日 tick 再尝试 AI。
+  let greetingAiBudget = 5;
   for (const event of eventsToRemind.slice(0, 50)) {
     const greeting = birthdayGreetings.get(event.id);
     if (!greeting) continue;
     const year = getTodayString(now, getEventTimezone(event.user_id, event.profile_id)).slice(0, 4);
+    const aiEnabledOverride = greetingAiBudget > 0;
     try {
-      await deliverBirthdayGreeting(event as unknown as BirthdayGreetingEvent, greeting, year);
+      const result = await deliverBirthdayGreeting(event as unknown as BirthdayGreetingEvent, greeting, year, { aiEnabledOverride });
+      if (result === 'sent' || result === 'draft') greetingAiBudget -= 1;
     } catch (error) {
       log.warn({ eventId: event.id, err: error }, 'Birthday greeting delivery failed');
     }
@@ -2092,9 +2103,10 @@ export async function cleanupSessions() {
   );
   log.info({ count: loginLogsResult.rowCount ?? 0 }, 'Cleaned up old login logs');
   
-  // 清理30天前的事件触发日志
+  // 清理90天前的事件触发日志（v2.26：与 retention.service 统一 90 天；
+  // 重要内容已由月度 digest 归档进 digest_archive，原行到期即清）
   const triggerResult = await query(
-    "DELETE FROM event_trigger_logs WHERE created_at < NOW() - INTERVAL '30 days'"
+    "DELETE FROM event_trigger_logs WHERE created_at < NOW() - INTERVAL '90 days'"
   );
   log.info({ count: triggerResult.rowCount ?? 0 }, 'Cleaned up old event trigger logs');
 }

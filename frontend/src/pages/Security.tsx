@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { MobileBottomNav } from '@/components/MobileBottomNav';
+import { AuditTrailCard } from '@/components/settings/AuditTrailCard';
 
 /**
  * `/api/security/deploy-info`. Typed rather than `any` because this page renders the
@@ -28,14 +29,19 @@ interface DeployInfo {
   schemaFutureVersions: number[];
   passwordChangedAt: string | null;
   turnstileConfigured: boolean;
+  /** v2.30：SiteKey 单独体检——只有 Secret 时登录页验证消失且登录被拒 */
+  turnstileSiteKeyConfigured: boolean;
   cronSecretConfigured: boolean;
+  /** v2.29：环境变量体检（必填 + 可选功能），只含布尔与提示，绝无变量值 */
+  envChecks?: Array<{ id: string; label: string; ok: boolean; hint: string; severity?: string }>;
 }
 
 function formatDeployTime(iso: string): string {
   const parsed = new Date(iso);
   return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString();
 }
-import { Shield, Monitor, Globe, Ban, Key, Clock, Trash2, ArrowLeft, Fingerprint, Plus } from 'lucide-react';
+import { Monitor, Globe, Ban, Key, Clock, Trash2, Fingerprint, Plus } from 'lucide-react';
+import { PageHeader } from '@/components/layout/PageHeader';
 import {
   isPasskeySupported,
   listPasskeys,
@@ -218,16 +224,15 @@ export default function Security() {
 
   return (
     <div className="min-h-screen pb-20 md:pb-8">
-      <header className="sticky top-0 z-20 backdrop-blur border-b border-white/10 px-4 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Button variant="ghost" size="icon" className="rounded-full" onClick={() => navigate(-1)} title="返回">
-            <ArrowLeft className="w-5 h-5" />
-          </Button>
-          <Shield className="w-5 h-5" />
-          <h1 className="font-semibold">安全中心</h1>
-        </div>
-        <div className="flex gap-2"><ThemeToggle /><Button variant="outline" size="sm" onClick={() => navigate('/settings')}>设置</Button></div>
-      </header>
+      <PageHeader
+        title="安全中心"
+        actions={
+          <>
+            <ThemeToggle />
+            <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>设置</Button>
+          </>
+        }
+      />
 
       <main className="max-w-4xl mx-auto p-4 space-y-4">
         {loadError && (
@@ -259,12 +264,42 @@ export default function Security() {
                 </p>
               )}
               <p>初始密码: {deployInfo.passwordChangedAt ? '已修改' : '尚未修改（建议尽快改）'}</p>
-              <p>Turnstile: {deployInfo.turnstileConfigured ? '已配置' : '未配置（可选）'}</p>
+              <p>
+                Turnstile:{' '}
+                {deployInfo.turnstileConfigured
+                  ? deployInfo.turnstileSiteKeyConfigured
+                    ? '已配置（SiteKey + Secret）'
+                    : '缺 Site Key（登录页验证不可用！）'
+                  : '未配置（可选）'}
+              </p>
               <p>Cron Secret: {deployInfo.cronSecretConfigured ? '已配置' : '未配置'}</p>
-              <p className="text-xs text-slate-500 pt-1">
+              <p className="text-xs text-slate-500 dark:text-slate-400 pt-1">
                 登录会话令牌由系统自动轮换（约 15 分钟续期 access、30 天 refresh），无需手动操作。
                 Vercel 环境变量（JWT_SECRET、MASTER_KEY、CRON_SECRET）配置一次即可，无需定期更换。
               </p>
+              {/* v2.29：环境变量体检 —— 哪些已配置、哪些可选功能还差变量，一目了然 */}
+              {deployInfo.envChecks && deployInfo.envChecks.length > 0 && (
+                <div className="pt-2 border-t border-slate-200/60 dark:border-slate-700/50">
+                  <p className="font-medium text-slate-700 dark:text-slate-200 pb-1.5">环境变量体检</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                    {deployInfo.envChecks.map((check) => (
+                      <div
+                        key={check.id}
+                        title={check.hint}
+                        className="flex items-start gap-2 text-xs p-1.5 rounded-lg bg-slate-50 dark:bg-slate-800/50"
+                      >
+                        <span className={`mt-0.5 shrink-0 ${check.ok ? 'text-green-600 dark:text-green-400' : check.severity === 'error' ? 'text-red-500 font-bold' : 'text-slate-400 dark:text-slate-500'}`}>
+                          {check.ok ? '✓' : check.severity === 'error' ? '✗' : '○'}
+                        </span>
+                        <span>
+                          <span className={check.ok ? 'text-slate-700 dark:text-slate-200' : 'text-slate-500 dark:text-slate-400'}>{check.label}</span>
+                          {!check.ok && <span className="block text-slate-400 dark:text-slate-500">{check.hint}</span>}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}
@@ -279,7 +314,7 @@ export default function Security() {
               <div key={s.id} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-sm">
                 <div>
                   <p>{s.deviceFingerprint?.slice(0, 20) || '未知设备'} {s.isCurrent && <span className="text-green-600">(当前)</span>}</p>
-                  <p className="text-xs text-slate-500">{new Date(s.createdAt).toLocaleString()}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{new Date(s.createdAt).toLocaleString()}</p>
                 </div>
                 {!s.isCurrent && <Button size="sm" variant="ghost" onClick={() => revokeSession(s.id)}><Trash2 className="w-4 h-4" /></Button>}
               </div>
@@ -314,7 +349,7 @@ export default function Security() {
                   <div key={pk.id} className="flex items-center justify-between p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-sm">
                     <div>
                       <p className="font-medium">{pk.deviceName || 'Passkey'}</p>
-                      <p className="text-xs text-slate-500">
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
                         注册于 {new Date(pk.createdAt).toLocaleString()}
                         {pk.lastUsedAt ? ` · 最近使用 ${new Date(pk.lastUsedAt).toLocaleString()}` : ''}
                       </p>
@@ -326,7 +361,7 @@ export default function Security() {
                 ))}
               </div>
             )}
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
               可在安全中心注册 Passkey 备用，当前登录默认仅需用户名和密码。若在安全中心启用了 TOTP，登录时需额外输入验证码。需 HTTPS（生产域名已支持）。
             </p>
           </CardContent>
@@ -370,7 +405,7 @@ export default function Security() {
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    <p className="text-xs text-slate-500">签发需要验证账号密码和当前验证器上的 6 位验证码。</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">签发需要验证账号密码和当前验证器上的 6 位验证码。</p>
                     <Input
                       type="password"
                       placeholder="账号密码"
@@ -390,7 +425,7 @@ export default function Security() {
             )}
             {totpEnabled && (
               <div className="space-y-2">
-                <p className="text-xs text-slate-500">关闭需要账号密码和当前验证码。关闭后已签发的恢复码会一并作废。</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">关闭需要账号密码和当前验证码。关闭后已签发的恢复码会一并作废。</p>
                 <Button size="sm" variant="destructive" onClick={disableTotp} disabled={recoveryBusy}>关闭双因素认证</Button>
               </div>
             )}
@@ -412,7 +447,7 @@ export default function Security() {
         <Card>
           <CardHeader><CardTitle className="text-base flex items-center gap-2"><Ban className="w-4 h-4" />IP 封禁列表</CardTitle></CardHeader>
           <CardContent className="space-y-2">
-            {ipBans.length === 0 ? <p className="text-sm text-slate-500">当前无封禁 IP</p> : ipBans.map((b) => (
+            {ipBans.length === 0 ? <p className="text-sm text-slate-500 dark:text-slate-400">当前无封禁 IP</p> : ipBans.map((b) => (
               <div key={b.ip} className="flex justify-between items-center text-sm p-2 bg-red-50 dark:bg-red-900/20 rounded">
                 <span>{b.ip} · {b.geo} · 至 {new Date(b.lockedUntil).toLocaleString()}</span>
                 <Button size="sm" variant="outline" onClick={() => unbanIp(b.ip)}>解封</Button>
@@ -432,15 +467,18 @@ export default function Security() {
 
         <Card>
           <CardHeader><CardTitle className="text-base flex items-center gap-2"><Clock className="w-4 h-4" />安全事件时间线</CardTitle></CardHeader>
-          <CardContent className="space-y-2 max-h-64 overflow-y-auto">
+          <CardContent className="space-y-2 max-h-64 overflow-y-auto overscroll-contain">
             {events.map((e) => (
               <div key={e.id} className="text-sm border-l-2 border-blue-400 pl-3 py-1">
                 <p className="font-medium">{e.event_type}</p>
-                <p className="text-xs text-slate-500">{e.ip_address} · {new Date(e.created_at).toLocaleString()}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">{e.ip_address} · {new Date(e.created_at).toLocaleString()}</p>
               </div>
             ))}
           </CardContent>
         </Card>
+
+        {/* v2.27 F45：操作审计卡（/api/audit 此前没有任何 UI 入口） */}
+        <AuditTrailCard />
       </main>
       <MobileBottomNav />
     </div>

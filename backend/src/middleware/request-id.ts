@@ -20,7 +20,24 @@ export function createRequestIdMiddleware(baseLogger: Logger = logger) {
       { event: 'http.request.received', method: c.req.method, path: c.req.path },
       'Request received',
     );
-    await runWithRequestLog({ requestId, logger: requestLogger }, () => next());
+    const startedAt = Date.now();
+    try {
+      await runWithRequestLog({ requestId, logger: requestLogger }, () => next());
+    } finally {
+      // v2.28 C11：补响应侧日志（status + 耗时）——此前只有请求侧，5xx/慢请求不可观测
+      requestLogger.info(
+        {
+          event: 'http.request.completed',
+          method: c.req.method,
+          path: c.req.path,
+          // next() 抛错时 c.res 在 onError 写响应前仍是惰性默认值（200）——
+          // 用 c.error 判定，避免 500 全部记成 200。
+          status: c.error ? 500 : c.res.status,
+          durationMs: Date.now() - startedAt,
+        },
+        'Request completed',
+      );
+    }
   };
 }
 

@@ -1,9 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Send, ShieldAlert, Sparkles, Wrench, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { stripMarkdownLight } from '@/lib/local-ai/text-clean';
 import { ASSISTANT_QUICK_PROMPTS } from '@/lib/assistant-intent';
 import type {
   AssistantConfirmation,
@@ -79,7 +80,7 @@ function ConfirmationCard({
             已确认并执行
           </p>
         ) : state === 'cancelled' ? (
-          <p data-testid="assistant-confirmation-cancelled" className="mt-3 text-sm font-semibold text-slate-500">
+          <p data-testid="assistant-confirmation-cancelled" className="mt-3 text-sm font-semibold text-slate-500 dark:text-slate-400">
             已取消（未执行）
           </p>
         ) : (
@@ -184,7 +185,7 @@ function MessageRow({
               : 'bg-slate-100 text-slate-800 dark:bg-white/10 dark:text-slate-100',
           )}
         >
-          {message.text}
+          {isUser ? message.text : stripMarkdownLight(message.text)}
         </div>
         {message.transcript && <TranscriptBlock transcript={message.transcript} />}
         {message.confirmation && (
@@ -231,7 +232,7 @@ function ManualToolForm({ assistant }: { assistant: AssistantController }) {
         手动调用工具（解析失败时的兜底）
       </summary>
       <div className="mt-2 space-y-2">
-        <label className="block text-xs text-slate-500" htmlFor="assistant-manual-tool">
+        <label className="block text-xs text-slate-500 dark:text-slate-400" htmlFor="assistant-manual-tool">
           工具
         </label>
         <select
@@ -249,7 +250,7 @@ function ManualToolForm({ assistant }: { assistant: AssistantController }) {
             </option>
           ))}
         </select>
-        <label className="block text-xs text-slate-500" htmlFor="assistant-manual-args">
+        <label className="block text-xs text-slate-500 dark:text-slate-400" htmlFor="assistant-manual-args">
           参数（JSON）
         </label>
         <textarea
@@ -282,6 +283,16 @@ export interface AssistantPanelProps {
 
 /** checkbox 109: the shared assistant surface used by both the /assistant page and the dock. */
 export function AssistantPanel({ assistant, variant = 'page', onClose, className }: AssistantPanelProps) {
+  // v2.28：消息列表自动滚底 —— 此前完全没有滚动控制，长回答尾部在可视区外
+  // v2.30：依赖加最后一条消息的文本长度——流式/长回答增长时也持续滚底。
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const messageCount = assistant.messages.length;
+  const lastTextLength = assistant.messages[messageCount - 1]?.text.length ?? 0;
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messageCount, lastTextLength]);
+
   const [draft, setDraft] = useState('');
   const empty = assistant.messages.length === 0;
   const quick = useMemo(() => [...ASSISTANT_QUICK_PROMPTS], []);
@@ -325,11 +336,13 @@ export function AssistantPanel({ assistant, variant = 'page', onClose, className
       </header>
 
       <div
+        ref={listRef}
         data-testid="assistant-message-list"
         role="log"
         aria-live="polite"
         aria-label="助手对话记录"
-        className="flex-1 space-y-3 overflow-y-auto rounded-2xl bg-white/40 p-3 dark:bg-black/20 min-h-40"
+        // v2.30：移除 overscroll-contain——滚到边界后手势被吞，用户感知为"滑不动"
+        className="flex-1 min-h-0 space-y-3 overflow-y-auto rounded-2xl bg-white/40 p-3 dark:bg-black/20 min-h-40"
       >
         {empty ? (
           <p className="py-6 text-center text-sm text-slate-400">
@@ -375,9 +388,26 @@ export function AssistantPanel({ assistant, variant = 'page', onClose, className
             autoComplete="off"
           />
         </div>
-        <Button type="submit" variant="vision" size="icon" aria-label="发送" data-testid="assistant-submit">
-          <Send size={18} aria-hidden />
-        </Button>
+        {assistant.runningTool ? (
+          /* v2.28：工具执行中提供真实停止（中止 HTTP 调用） */
+          <Button
+            type="button"
+            variant="destructive"
+            size="icon"
+            aria-label="停止"
+            data-testid="assistant-stop"
+            onClick={(e) => {
+              e.preventDefault();
+              assistant.stop();
+            }}
+          >
+            <X size={18} aria-hidden />
+          </Button>
+        ) : (
+          <Button type="submit" variant="vision" size="icon" aria-label="发送" data-testid="assistant-submit">
+            <Send size={18} aria-hidden />
+          </Button>
+        )}
       </form>
 
       {variant === 'page' && <ManualToolForm assistant={assistant} />}
