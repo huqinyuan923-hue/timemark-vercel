@@ -11,6 +11,9 @@ const features = new Hono<{ Variables: { user: User } }>();
 
 features.get('/share/:token', async (c) => {
   const token = c.req.param('token');
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) {
+    return c.json({ success: false, error: 'Invalid token' }, 400);
+  }
   const result = await query(
     `SELECT name, type, date, calendar_type, person_name, tags
      FROM events WHERE share_token = $1 LIMIT 1`,
@@ -26,7 +29,12 @@ features.use('*', authMiddleware);
 
 features.get('/annual-report', async (c) => {
   const userId = Number(c.get('user').id);
-  const year = parseInt(c.req.query('year') || String(new Date().getFullYear()), 10);
+  const parsedYear = parseInt(c.req.query('year') || String(new Date().getFullYear()), 10);
+  // 年份限定在合理区间，异常值回退到当前年份
+  const year =
+    Number.isInteger(parsedYear) && parsedYear >= 1900 && parsedYear <= 2100
+      ? parsedYear
+      : new Date().getFullYear();
 
   const [events, triggers, channels, monthly, channelStats] = await Promise.all([
     query('SELECT COUNT(*)::int AS total FROM events WHERE user_id = $1', [userId]),
@@ -34,7 +42,7 @@ features.get('/annual-report', async (c) => {
       `SELECT COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'success')::int AS success,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-       FROM event_trigger_logs WHERE user_id = $1 AND LEFT(trigger_date, 4) = $2::text`,
+       FROM event_trigger_logs WHERE user_id = $1 AND EXTRACT(YEAR FROM trigger_date) = $2`,
       [userId, year],
     ),
     query('SELECT COUNT(*)::int AS total FROM notification_accounts WHERE user_id = $1 AND is_active = TRUE', [userId]),
@@ -49,7 +57,7 @@ features.get('/annual-report', async (c) => {
               COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'success')::int AS success
        FROM event_trigger_logs
-       WHERE user_id = $1 AND LEFT(trigger_date, 4) = $2::text AND channel_type IS NOT NULL
+       WHERE user_id = $1 AND EXTRACT(YEAR FROM trigger_date) = $2 AND channel_type IS NOT NULL
        GROUP BY channel_type`,
       [userId, year],
     ),

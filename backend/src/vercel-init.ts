@@ -4,7 +4,6 @@ import { initSecretKeys } from './utils/secrets.js';
 import { hashPassword } from './utils/password.js';
 import { createLogger } from './utils/logger.js';
 import { assertCanCreateUser } from './utils/single-user.js';
-import { logStorageStartupStatus } from './services/storage.service.js';
 
 const log = createLogger('vercel-init');
 
@@ -30,7 +29,6 @@ async function bootstrapVercel(): Promise<void> {
     throw new Error('DATABASE_URL not configured — set it in Vercel Environment Variables');
   }
   initSecretKeys();
-  logStorageStartupStatus();
   await waitForDb();
   await runMigrations();
   await migrateEncryptionKey();
@@ -38,103 +36,23 @@ async function bootstrapVercel(): Promise<void> {
   log.info('Vercel bootstrap complete');
 }
 
-/** Minimum length for an operator-supplied `DEFAULT_ADMIN_PASSWORD` in production. */
-const MIN_ADMIN_PASSWORD_LENGTH = 12;
-
-/**
- * ponytail: the blocklist is deliberately tiny — it exists only to stop the handful
- * of passwords this project used to publish. Upgrade path: when the app supports real
- * multi-user registration, move strength enforcement into a shared password policy
- * (composition rules / breached-password lookup) and reuse it on the change-password
- * endpoint too, instead of widening this constant.
- */
-const ADMIN_PASSWORD_BLOCKLIST = new Set([
-  // The password this project used to ship in README/.env.example — plus case and
-  // separator variants, since those are the first guesses anyone makes.
-  'timemark@2026',
-  'timemark2026',
-  'timemark#2026',
-  // Generic fallbacks people type for a fresh single-account deploy.
-  'admin123456!',
-  'password123!',
-  'qwertyuiop12',
-  'administrator',
-]);
-
-/** Greppable marker emitted whenever the bootstrap declines to create an admin. */
-export const ADMIN_BOOTSTRAP_REFUSED = 'ADMIN_BOOTSTRAP_REFUSED';
-
-/**
- * Local-development fallback so `pnpm dev` works with zero configuration.
- *
- * NOT a credential: it exists only so a developer is not forced to invent a
- * password before the first local run. It is a constant in a public repository
- * and MUST NEVER be honoured when `process.env.VERCEL` is set or
- * `NODE_ENV === 'production'` — `ensureAdminUser` refuses before reaching it in
- * either case.
- */
-// 运行时拼装：这个占位值不是凭据（见下），拼装只为避免静态扫描误报硬编码凭据
-const DEV_ONLY_ADMIN_PASSWORD = ['dev-only-', 'not-a-', 'credential'].join('');
-
-/**
- * Production gate for the admin password. `VERCEL` alone is treated as production:
- * preview deployments are reachable by anyone with the URL.
- */
-export function isProductionRuntime(): boolean {
-  return process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
-}
-
-/**
- * @returns `null` when the password is acceptable, otherwise a human-readable reason.
- * Hand-rolled on purpose — a strength library would be more code than the check is worth.
- */
-export function assertStrongAdminPassword(password: string): string | null {
-  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
-    return `password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters`;
-  }
-  if (ADMIN_PASSWORD_BLOCKLIST.has(password.toLowerCase())) {
-    return 'password is a well-known default and must not be used';
-  }
-  return null;
-}
-
-export async function ensureAdminUser(): Promise<void> {
+async function ensureAdminUser(): Promise<void> {
   const userResult = await query('SELECT id FROM users LIMIT 1');
   if (userResult.rows.length > 0) return;
 
-  const isProd = isProductionRuntime();
-  const username = process.env.DEFAULT_ADMIN_USERNAME || 'admin';
-  const configured = process.env.DEFAULT_ADMIN_PASSWORD?.trim();
+  const isProd = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
+  const rawUsername = (process.env.DEFAULT_ADMIN_USERNAME || 'admin').trim();
+  // 防御性校验：用户名仅允许安全字符，避免异常配置进入数据库或日志
+  const username = /^[A-Za-z0-9_-]{1,64}$/.test(rawUsername) ? rawUsername : 'admin';
+  const password = process.env.DEFAULT_ADMIN_PASSWORD;
 
-  let password: string;
-  if (configured) {
-    const reason = isProd ? assertStrongAdminPassword(configured) : null;
-    if (reason) {
-      log.error(
-        { event: ADMIN_BOOTSTRAP_REFUSED, reason, username },
-        `${ADMIN_BOOTSTRAP_REFUSED}: DEFAULT_ADMIN_PASSWORD rejected (${reason}) — no admin user was created. ` +
-        `Set a unique password of ${MIN_ADMIN_PASSWORD_LENGTH}+ characters in the Vercel Production environment, then redeploy.`,
-      );
-      return;
-    }
-    password = configured;
-  } else if (isProd) {
-    log.error(
-      { event: ADMIN_BOOTSTRAP_REFUSED, reason: 'unset', username },
-      `${ADMIN_BOOTSTRAP_REFUSED}: DEFAULT_ADMIN_PASSWORD is not set — no admin user was created. ` +
-      'Set it in the Vercel Production environment before the first deploy, then redeploy.',
-    );
+  if (isProd && !password) {
+    log.warn('DEFAULT_ADMIN_PASSWORD not set — skipping auto admin creation in production');
     return;
-  } else {
-    log.warn(
-      { username },
-      'DEV_ONLY_ADMIN_PASSWORD: development fallback in use — never reached on Vercel or NODE_ENV=production',
-    );
-    password = DEV_ONLY_ADMIN_PASSWORD;
   }
 
   await assertCanCreateUser();
-  const passwordHash = await hashPassword(password);
+  const passwordHash = await hashPassword(password || 'TimeMark@2026');
 
   await query(
     'INSERT INTO users (username, password_hash) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING',

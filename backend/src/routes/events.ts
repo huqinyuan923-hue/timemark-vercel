@@ -1,14 +1,16 @@
 import { Hono } from 'hono';
-import { z } from 'zod';
 import { authMiddleware } from '../middleware/auth.middleware.js';
-import { createEvent, getEventsByUserIdPaginated, updateEvent, deleteEvent, deleteEventsByIds } from '../services/event.service.js';
-import { createEventSchema, updateEventSchema, batchDeleteSchema, csvImportSchema, formatZodError, readDelivery } from '@timemark/shared';
+import { createEvent, getEventsByUserId, getEventsByUserIdPaginated, updateEvent, deleteEvent, deleteEventsByIds } from '../services/event.service.js';
+import { createEventSchema, updateEventSchema, batchDeleteSchema, csvImportSchema, formatZodError } from '@timemark/shared';
 import { query } from '../db/index.js';
 import type { User } from '@timemark/shared';
-import { createLogger, logFireAndForget } from '../utils/logger.js';
-import { parseProfileFilter } from './profile-filter.js';
 
 const events = new Hono<{ Variables: { user: User } }>();
+
+/** 错误信息入库前清洗：去掉控制字符并截断，防止异常内容污染日志与数据库 */
+function sanitizeErrorMessage(msg: string): string {
+  return msg.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 500);
+}
 
 events.use('*', authMiddleware);
 
@@ -19,13 +21,9 @@ events.get('/', async (c) => {
   const page = parseInt(c.req.query('page') || '1', 10);
   const limit = parseInt(c.req.query('limit') || '50', 10);
   const offset = (page - 1) * limit;
-
-  // 可选档案过滤（checkbox 69）：省略 = 全部档案；他人的档案一律 404。
-  const profileFilter = await parseProfileFilter(c, Number(user.id));
-  if (profileFilter instanceof Response) return profileFilter;
   
   // 获取分页数据
-  const result = await getEventsByUserIdPaginated(user.id, limit, offset, profileFilter);
+  const result = await getEventsByUserIdPaginated(user.id, limit, offset);
   
   return c.json({
     success: true,
@@ -45,7 +43,7 @@ events.post('/', async (c) => {
   const parsed = createEventSchema.safeParse(body);
 
   if (!parsed.success) {
-    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: parsed.error.flatten() }, 400);
   }
 
   // Validate notification_account_ids if provided
@@ -74,9 +72,7 @@ events.post('/', async (c) => {
 
   const event = await createEvent(user.id, parsed.data);
   const { refreshUserEventCache } = await import('../services/event-cache.service.js');
-  refreshUserEventCache(Number(user.id)).catch(
-  logFireAndForget('events.cache_refresh_failed', 'Failed to refresh user event cache'),
-);
+  refreshUserEventCache(Number(user.id)).catch(() => {});
   
   // 事件创建后立即检查是否需要发送提醒
   // 这样可以确保不会错过即将到来的提醒时间
@@ -95,18 +91,8 @@ events.get('/reminder-logs', async (c) => {
   const userId = Number(user.id);
   const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 200);
 
-  // Display contract: trigger_date is TEXT since migration 51 and holds two families of ids.
-  // A row's first 10 chars are a calendar day `YYYY-MM-DD` ONLY for legacy rows (exactly
-  // 10 chars) and for normal dedup tokens `YYYY-MM-DD#d<n>#tHH:mm`; namespaced keys such as
-  // `snooze:event#<id>#<ISO>` (buildSnoozeSendKey -> recordEventTrigger) carry NO leading
-  // date - `LEFT('snooze:event#...', 10)` is `snooze:eve`. An unguarded LEFT would mangle
-  // those rows, so expose the 10-char ymd only when the prefix really is one; otherwise
-  // return the raw key unchanged. Raw dedup keys stay available via /trigger-logs + its CSV
-  // export, and the UI never parses trigger_date into a Date.
   const result = await query(
-    `SELECT tl.id, tl.event_id, tl.trigger_type,
-            CASE WHEN tl.trigger_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN LEFT(tl.trigger_date, 10) ELSE tl.trigger_date END AS trigger_date,
-            tl.status,
+    `SELECT tl.id, tl.event_id, tl.trigger_type, tl.trigger_date, tl.status,
             tl.error_message, tl.channel_results, tl.created_at,
             e.name AS event_name, e.type AS event_type
      FROM event_trigger_logs tl
@@ -119,64 +105,6 @@ events.get('/reminder-logs', async (c) => {
 
   return c.json({ success: true, data: result.rows });
 });
-
-const testSendLog = createLogger('events.test-send');
-
-/** 解析事件行上的通知账号绑定（JSONB 数组或 JSON 字符串；与 sendNotifications 的容错一致）。 */
-function parseBoundAccountIds(raw: unknown): number[] {
-  let value: unknown = raw;
-  if (typeof raw === 'string') {
-    try {
-      value = JSON.parse(raw);
-    } catch {
-      // 损坏的绑定字段 -> 无绑定（与 sendNotifications 的解析一致，不放大成 500）。
-      return [];
-    }
-  }
-  return Array.isArray(value)
-    ? value.map((item) => Number(item)).filter((accountId) => Number.isInteger(accountId) && accountId > 0)
-    : [];
-}
-
-/**
- * checkbox 167（QA 失败场景）：手动测试发送全部失败且事件显式绑定了通知账号时，
- * 找出「已停用」且对应渠道 no_configuration 的账号并点名，而不是只返回通用错误。
- * 查询失败只记日志并退回通用错误 —— 辅助信息绝不能让 400 变成 500。
- */
-async function describeUnavailableBoundAccounts(
-  event: Record<string, unknown>,
-  channelResults: Record<string, { success: boolean; error?: string }>,
-  userId: number,
-): Promise<string | null> {
-  const boundIds = parseBoundAccountIds(event.notification_account_ids);
-  if (boundIds.length === 0) return null;
-  const failedChannels = new Set(
-    Object.entries(channelResults)
-      .filter(([, result]) => !result.success && result.error === 'no_configuration')
-      .map(([channel]) => channel),
-  );
-  if (failedChannels.size === 0) return null;
-  try {
-    const accounts = await query(
-      `SELECT id, name, type, is_active FROM notification_accounts
-       WHERE user_id = $1 AND id = ANY($2::int[])`,
-      [userId, boundIds],
-    );
-    const inactive = (accounts.rows as Array<Record<string, unknown>>).filter(
-      (row) => row.is_active === false && failedChannels.has(String(row.type)),
-    );
-    if (inactive.length === 0) return null;
-    return inactive
-      .map((row) => `账号「${String(row.name || row.type)}」(#${String(row.id)}, ${String(row.type)}) 已停用`)
-      .join('、');
-  } catch (error) {
-    testSendLog.error(
-      { event: 'manual_test_send.bound_accounts_lookup_failed', userId, err: error },
-      'Failed to describe unavailable bound notification accounts',
-    );
-    return null;
-  }
-}
 
 events.post('/:id/test-send', async (c) => {
   const user = c.get('user');
@@ -192,27 +120,13 @@ events.post('/:id/test-send', async (c) => {
   
   const event = result.rows[0];
   const rawChannels = event.notification_channels;
-  const baseChannels = typeof rawChannels === 'string' ? JSON.parse(rawChannels) : (rawChannels || []);
-  const today = new Date().toISOString().slice(0, 10);
-
-  // checkbox 167：手动测试发送必须和定时路径使用同一套渠道解析
-  // （条件规则 > 套餐分级 > 事件渠道 > 用户自己的启用账号）。事件没有显式勾选渠道时，
-  // 单用户安装也应回退到 owner 已配置的账号；优先级不在这里重写 —— 一律调用 resolver。
-  const { resolveReminderChannels } = await import('../services/reminder-channel-resolver.service.js');
-  const channels = await resolveReminderChannels(Number(user.id), baseChannels, 0);
+  const channels = typeof rawChannels === 'string' ? JSON.parse(rawChannels) : (rawChannels || []);
 
   if (channels.length === 0) {
-    // 与 checkbox 165 的定时路径一致：无渠道可用时绝不静默消失 —— 写入同款 skipped 记录
-    // （status='skipped' + 机器可读原因，同一 reminder_send_claims 去重），并返回点名设置
-    // 的可操作错误。recordSkippedTrigger 自身绝不抛出/growl，失败会打 error 日志。
-    const { recordSkippedTrigger, NO_CHANNEL_RESOLVED_REASON } = await import('../jobs/tasks.js');
-    await recordSkippedTrigger(Number(event.id), Number(event.id), Number(user.id), today, 'manual_test');
-    return c.json({
-      success: false,
-      error: '未找到可用的通知渠道：请先在「设置 → 通知渠道」启用至少一个通知账号，或在事件中勾选渠道后重试。',
-      data: { reason: NO_CHANNEL_RESOLVED_REASON },
-    }, 400);
+    return c.json({ success: false, error: '请先为事件配置通知渠道' }, 400);
   }
+
+  const today = new Date().toISOString().slice(0, 10);
 
   try {
     const channelResults = await sendNotifications(event, Number(user.id), channels, { skipQuietHours: true });
@@ -224,28 +138,17 @@ events.post('/:id/test-send', async (c) => {
         data: { channelResults },
       }, 400);
     }
-    // 只看真实渠道：所有渠道都被 filterSupportedChannels 丢掉时，结果里除了被丢掉的
-    // 渠道还有一个 _skipped 标记，它是 success:false 但不是渠道。旧代码把它一起写进
-    // error_details.channel_type 与 error_message，于是提醒日志里出现一个叫 _skipped
-    // 的渠道。判定与 jobs/tasks.ts、trigger-logs 重试写回用同一个 readDelivery。
-    const delivery = readDelivery({ channelResults });
-    const hasFailure = delivery.failed.length > 0;
-    const allFailed = delivery.delivered.length === 0;
+    const hasFailure = values.some((r) => !r.success);
+    const allFailed = values.length > 0 && values.every((r) => !r.success);
     const status = allFailed ? 'failed' : hasFailure ? 'partial' : 'success';
-    // checkbox 167（QA 失败场景）：绑定账号已停用时点名该账号；同时写进提醒日志的错误信息。
-    const boundAccountNote = allFailed
-      ? await describeUnavailableBoundAccounts(event, channelResults, Number(user.id))
-      : null;
-    const errorMessage = boundAccountNote
-      ? `绑定通知账号不可用：${boundAccountNote}。请在「设置 → 通知渠道」重新启用或改绑其他账号后重试。`
-      : hasFailure
-        ? delivery.reason
-        : undefined;
-
-    const sent = channelResults as Record<string, { success?: boolean; error?: string }>;
-    const failedEntries = delivery.failed
-      .map((channel) => [channel, sent[channel]] as const)
-      .filter((entry): entry is readonly [string, { success?: boolean; error?: string }] => !!entry[1]);
+    const errorMessage = hasFailure
+      ? sanitizeErrorMessage(
+          Object.entries(channelResults)
+            .filter(([, r]) => !r.success)
+            .map(([ch, r]) => `${ch}: ${r.error}`)
+            .join('; '),
+        )
+      : undefined;
 
     await recordEventTrigger(
       Number(event.id),
@@ -257,8 +160,8 @@ events.post('/:id/test-send', async (c) => {
       JSON.stringify(channelResults),
       hasFailure
         ? {
-            channel_type: failedEntries.map(([ch]) => ch).join(','),
-            details: failedEntries.map(([ch, r]) => ({ channel: ch, error: r.error })),
+            channel_type: Object.entries(channelResults).filter(([, r]) => !r.success).map(([ch]) => ch).join(','),
+            details: Object.entries(channelResults).filter(([, r]) => !r.success).map(([ch, r]) => ({ channel: ch, error: r.error })),
           }
         : undefined,
     );
@@ -274,49 +177,11 @@ events.post('/:id/test-send', async (c) => {
     });
   } catch (error) {
     console.error('[test-send] Error:', error);
-    const errMsg = error instanceof Error ? error.message : 'Failed to send notification';
+    const errMsg = sanitizeErrorMessage(
+      error instanceof Error ? error.message : 'Failed to send notification',
+    );
     await recordEventTrigger(Number(event.id), Number(user.id), 'manual_test', today, 'failed', errMsg);
     return c.json({ success: false, error: errMsg }, 500);
-  }
-});
-
-/**
- * Web Push 通知上的「延后」动作（见 services/notifications/webpush.service.ts 的 actions）。
- *
- * 复用 bot 的 snoozeTodo，而不是在这里重写 UPDATE：snoozed_until 的语义（从请求时刻起算、
- * 不动 date/next_occurrence、刷新 cron 缓存）只有那一个实现知道，抄一份必然漂移。
- * bot 的 /snooze 命令与这个 HTTP 端点因此永远一致。
- */
-events.post('/:id/snooze', async (c) => {
-  const user = c.get('user');
-  const eventId = Number(c.req.param('id'));
-  if (!Number.isInteger(eventId) || eventId <= 0) {
-    return c.json({ success: false, error: 'Invalid event id' }, 400);
-  }
-
-  let minutes = 10;
-  try {
-    const body = await c.req.json();
-    // 只接受一个有限的档位：通知按钮是固定文案，不该由请求体决定延后多久。
-    if (body && Number.isInteger(body.minutes)) minutes = Number(body.minutes);
-  } catch {
-    // 没有 body 就用默认 10 分钟（通知上那个按钮的语义）
-  }
-  if (![10, 60, 1440].includes(minutes)) {
-    return c.json({ success: false, error: 'Unsupported snooze duration' }, 400);
-  }
-
-  try {
-    const { defaultBotDataProvider } = await import('../services/bot/bot-data.service.js');
-    const result = await defaultBotDataProvider.snoozeTodo(Number(user.id), eventId, minutes);
-    if (result.status === 'not_found') {
-      // 不泄露别人的事件是否存在
-      return c.json({ success: false, error: 'Event not found' }, 404);
-    }
-    return c.json({ success: true, data: { snoozedUntil: result.snoozedUntil, localTime: result.localTime } });
-  } catch (error) {
-    console.error('[snooze] Error:', error);
-    return c.json({ success: false, error: 'Failed to snooze reminder' }, 500);
   }
 });
 
@@ -327,7 +192,7 @@ events.put('/:id', async (c) => {
   const parsed = updateEventSchema.safeParse(body);
 
   if (!parsed.success) {
-    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: parsed.error.flatten() }, 400);
   }
 
   // Validate notification_account_ids if provided
@@ -359,9 +224,7 @@ events.put('/:id', async (c) => {
     return c.json({ success: false, error: 'Event not found' }, 404);
   }
   const { refreshUserEventCache } = await import('../services/event-cache.service.js');
-  refreshUserEventCache(Number(user.id)).catch(
-  logFireAndForget('events.cache_refresh_failed', 'Failed to refresh user event cache'),
-);
+  refreshUserEventCache(Number(user.id)).catch(() => {});
 
   // 事件更新后立即检查是否需要发送提醒
   // 这样可以确保不会错过即将到来的提醒时间
@@ -381,14 +244,12 @@ events.delete('/batch', async (c) => {
   const parsed = batchDeleteSchema.safeParse(body);
 
   if (!parsed.success) {
-    return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+    return c.json({ success: false, error: formatZodError(parsed.error), details: parsed.error.flatten() }, 400);
   }
 
   const deleted = await deleteEventsByIds(parsed.data.ids, user.id);
   const { refreshUserEventCache } = await import('../services/event-cache.service.js');
-  refreshUserEventCache(Number(user.id)).catch(
-  logFireAndForget('events.cache_refresh_failed', 'Failed to refresh user event cache'),
-);
+  refreshUserEventCache(Number(user.id)).catch(() => {});
   return c.json({ success: true, data: { deleted } });
 });
 
@@ -401,9 +262,7 @@ events.delete('/:id', async (c) => {
     return c.json({ success: false, error: 'Event not found' }, 404);
   }
   const { refreshUserEventCache } = await import('../services/event-cache.service.js');
-  refreshUserEventCache(Number(user.id)).catch(
-  logFireAndForget('events.cache_refresh_failed', 'Failed to refresh user event cache'),
-);
+  refreshUserEventCache(Number(user.id)).catch(() => {});
 
   return c.json({ success: true });
 });
@@ -418,7 +277,7 @@ events.post('/import-csv', async (c) => {
     const parsed = csvImportSchema.safeParse(body);
     
     if (!parsed.success) {
-      return c.json({ success: false, error: formatZodError(parsed.error), details: z.flattenError(parsed.error) }, 400);
+      return c.json({ success: false, error: formatZodError(parsed.error), details: parsed.error.flatten() }, 400);
     }
     
     const { csvData } = parsed.data;
