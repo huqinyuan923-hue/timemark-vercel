@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from 'crypto';
-import { query } from '../db/index.js';
+import { query, waitForDb } from '../db/index.js';
 import { encrypt, decrypt } from '@timemark/shared/crypto';
 import { normalizeNotificationChatId } from '@timemark/shared';
 import { normalizeDigestSections, sanitizeDigestRecipients, type DigestSectionKey } from './digest-sections.js';
@@ -808,7 +808,9 @@ export async function generateApiKey(userId: number): Promise<string> {
   const plaintext = `tm_${randomBytes(32).toString('hex')}`;
   const hash = createHash('sha256').update(plaintext).digest('hex');
 
-  await query(
+  // 安全敏感路径：直连参数化查询（SQL 为字面量，值全部走占位符绑定）
+  const db = await waitForDb();
+  await db.query(
     `INSERT INTO user_configs (user_id, api_key_hash)
      VALUES ($1, $2)
      ON CONFLICT (user_id) DO UPDATE SET api_key_hash = EXCLUDED.api_key_hash`,

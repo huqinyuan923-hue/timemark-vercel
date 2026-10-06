@@ -1,4 +1,4 @@
-import { query } from '../db/index.js';
+import { waitForDb } from '../db/index.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('trigger-log');
@@ -31,7 +31,10 @@ export async function recordEventTrigger(
   errorDetails?: { channel_type?: string; account_id?: number; details?: unknown },
 ): Promise<boolean> {
   try {
-    await query(
+    // 错误信息等字符串可能来自外部通知服务的响应：
+    // 使用字面量 SQL + 占位符绑定的直连方式，避免经过动态 SQL 封装
+    const db = await waitForDb();
+    await db.query(
       `INSERT INTO event_trigger_logs
        (event_id, user_id, trigger_type, trigger_date, status, error_message, channel_results, error_details, channel_type, account_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,

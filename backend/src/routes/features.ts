@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { randomBytes } from 'crypto';
 import { authMiddleware } from '../middleware/auth.middleware.js';
-import { query } from '../db/index.js';
+import { query, waitForDb } from '../db/index.js';
 import { getBlessing } from '@timemark/shared';
 import { getRecommendedDaysBefore, getRecommendedDaysFromHistory } from '../services/recommendations.js';
 import { getServerlessFeatureReport } from '../utils/serverless-suitability.js';
@@ -14,7 +14,9 @@ features.get('/share/:token', async (c) => {
   if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) {
     return c.json({ success: false, error: 'Invalid token' }, 400);
   }
-  const result = await query(
+  // 外部输入直达查询：使用字面量 SQL + 占位符绑定的直连方式
+  const db = await waitForDb();
+  const result = await db.query(
     `SELECT name, type, date, calendar_type, person_name, tags
      FROM events WHERE share_token = $1 LIMIT 1`,
     [token],
@@ -36,34 +38,35 @@ features.get('/annual-report', async (c) => {
       ? parsedYear
       : new Date().getFullYear();
 
+  const db = await waitForDb();
   const [events, triggers, channels, monthly, channelStats] = await Promise.all([
-    query('SELECT COUNT(*)::int AS total FROM events WHERE user_id = $1', [userId]),
-    query(
+    db.query('SELECT COUNT(*)::int AS total FROM events WHERE user_id = $1', [userId]),
+    db.query(
       `SELECT COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'success')::int AS success,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-       FROM event_trigger_logs WHERE user_id = $1 AND EXTRACT(YEAR FROM trigger_date) = $2`,
+       FROM event_trigger_logs WHERE user_id = $1 AND LEFT(trigger_date, 4) = $2::text`,
       [userId, year],
     ),
-    query('SELECT COUNT(*)::int AS total FROM notification_accounts WHERE user_id = $1 AND is_active = TRUE', [userId]),
-    query(
+    db.query('SELECT COUNT(*)::int AS total FROM notification_accounts WHERE user_id = $1 AND is_active = TRUE', [userId]),
+    db.query(
       `SELECT EXTRACT(MONTH FROM date)::int AS month, COUNT(*)::int AS count
        FROM events WHERE user_id = $1 AND EXTRACT(YEAR FROM date) = $2
        GROUP BY 1 ORDER BY 1`,
       [userId, year],
     ),
-    query(
+    db.query(
       `SELECT channel_type AS channel,
               COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'success')::int AS success
        FROM event_trigger_logs
-       WHERE user_id = $1 AND EXTRACT(YEAR FROM trigger_date) = $2 AND channel_type IS NOT NULL
+       WHERE user_id = $1 AND LEFT(trigger_date, 4) = $2::text AND channel_type IS NOT NULL
        GROUP BY channel_type`,
       [userId, year],
     ),
   ]);
 
-  const byType = await query(
+  const byType = await db.query(
     `SELECT type, COUNT(*)::int AS count FROM events WHERE user_id = $1 GROUP BY type ORDER BY count DESC`,
     [userId],
   );

@@ -2,7 +2,7 @@
 import { authenticator } from 'otplib';
 import QRCode from 'qrcode';
 import { authMiddleware } from '../middleware/auth.middleware.js';
-import { query } from '../db/index.js';
+import { query, waitForDb } from '../db/index.js';
 import { getClientIp } from '../utils/client-ip.js';
 import { logSecurityEvent } from '../services/security-event.service.js';
 import { deleteSessionById, deleteAllUserSessions } from '../services/session.service.js';
@@ -35,7 +35,8 @@ security.get('/sessions', async (c) => {
 
   const sessions = await Promise.all(
     result.rows.map(async (row: Record<string, unknown>) => {
-      const sessionRow = await query('SELECT token FROM sessions WHERE id = $1', [row.id]);
+      const db = await waitForDb();
+      const sessionRow = await db.query('SELECT token FROM sessions WHERE id = $1', [row.id]);
       const token = sessionRow.rows[0]?.token as string | undefined;
       return {
         id: row.id,
