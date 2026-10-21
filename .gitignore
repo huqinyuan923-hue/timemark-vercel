@@ -4,6 +4,8 @@ build
 .env
 .env.*
 !.env.example
+# 本机私密配置的文件名以 .local- 开头，上面的 .env* 匹配不到
+.local-*.env
 *.log
 .DS_Store
 .docker-cache
